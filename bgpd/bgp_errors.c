@@ -486,6 +486,18 @@ static struct log_ref ferr_bgp_err[] = {
 		.suggestion = "Check connectivity to the peer and that it is not overloaded",
 	},
 	{
+		.code = EC_BGP_MUP_FAIL,
+		.title = "BGP MUP install/uninstall error",
+		.description = "BGP attempted to install or uninstall an MUP prefix and failed",
+		.suggestion = "Most likely a bug. If the problem persists, report the problem for troubleshooting"
+	},
+	{
+		.code = EC_BGP_MUP_ROUTE_INVALID,
+		.title = "BGP MUP route received with invalid contents",
+		.description = "BGP received an MUP route with invalid contents",
+		.suggestion = "Determine the source of the MUP route and resolve whatever is causing invalid contents"
+	},
+	{
 		.code = END_FERR,
 	}
 };

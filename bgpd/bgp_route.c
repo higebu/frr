@@ -72,6 +72,7 @@
 #include "bgpd/bgp_evpn_vty.h"
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_flowspec_util.h"
+#include "bgpd/bgp_mup_vty.h"
 #include "bgpd/bgp_pbr.h"
 
 #include "bgpd/bgp_route_clippy.c"
@@ -4754,7 +4755,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 		/* Nexthop reachability check - for unicast and
 		 * labeled-unicast.. */
 		if (((afi == AFI_IP || afi == AFI_IP6) &&
-		     (safi == SAFI_UNICAST || safi == SAFI_LABELED_UNICAST ||
+		     (safi == SAFI_UNICAST || safi == SAFI_LABELED_UNICAST || safi == SAFI_MUP ||
 		      (safi == SAFI_MPLS_VPN &&
 		       pi->sub_type != BGP_ROUTE_IMPORTED))) ||
 		    (safi == SAFI_EVPN &&
@@ -4926,7 +4927,7 @@ void bgp_update(struct peer *peer, const struct prefix *p, uint32_t addpath_id,
 
 	/* Nexthop reachability check. */
 	if (((afi == AFI_IP || afi == AFI_IP6) &&
-	     (safi == SAFI_UNICAST || safi == SAFI_LABELED_UNICAST ||
+	     (safi == SAFI_UNICAST || safi == SAFI_LABELED_UNICAST || safi == SAFI_MUP ||
 	      (safi == SAFI_MPLS_VPN &&
 	       new->sub_type != BGP_ROUTE_IMPORTED))) ||
 	    (safi == SAFI_EVPN && bgp_evpn_is_prefix_nht_supported(p))) {
@@ -9323,6 +9324,39 @@ void route_vty_out(struct vty *vty, const struct prefix *p,
 					vty_out(vty, "%*s", len, " ");
 			}
 		}
+	} else if (safi == SAFI_MUP) {
+		if (json_paths) {
+			json_nexthop_global = json_object_new_object();
+
+			json_object_string_addf(json_nexthop_global, "ip",
+						"%pI4",
+						&attr->mp_nexthop_global_in);
+
+			if (path->peer->hostname)
+				json_object_string_add(json_nexthop_global,
+						       "hostname",
+						       path->peer->hostname);
+
+			json_object_string_add(json_nexthop_global, "afi",
+					       "ipv4");
+			json_object_boolean_true_add(json_nexthop_global,
+						     "used");
+		} else {
+			if (nexthop_hostname)
+				len = vty_out(vty, "%pI4(%s)%s",
+					      &attr->mp_nexthop_global_in,
+					      nexthop_hostname, vrf_id_str);
+			else
+				len = vty_out(vty, "%pI4%s",
+					      &attr->mp_nexthop_global_in,
+					      vrf_id_str);
+
+			len = wide ? (41 - len) : (16 - len);
+			if (len < 1)
+				vty_out(vty, "\n%*s", 36, " ");
+			else
+				vty_out(vty, "%*s", len, " ");
+		}
 	} else if (p->family == AF_INET && !BGP_ATTR_MP_NEXTHOP_LEN_IP6(attr)) {
 		if (json_paths) {
 			json_nexthop_global = json_object_new_object();
@@ -11825,6 +11859,9 @@ static int bgp_show(struct vty *vty, struct bgp *bgp, afi_t afi, safi_t safi,
 	if (safi == SAFI_EVPN)
 		return bgp_evpn_show_all_routes(vty, bgp, type, use_json, 0);
 
+	if (safi == SAFI_MUP)
+		return bgp_mup_show_all_routes(vty, bgp, afi, table, type, use_json, 0);
+
 	return bgp_show_table(vty, bgp, safi, table, type, output_arg, NULL, 1,
 			      NULL, NULL, &json_header_depth, show_flags,
 			      rpki_target_state);
@@ -12215,7 +12252,7 @@ static int bgp_show_route_in_table(struct vty *vty, struct bgp *bgp,
 	if (use_json)
 		json = json_object_new_object();
 
-	if (safi == SAFI_MPLS_VPN || safi == SAFI_ENCAP) {
+	if (safi == SAFI_MPLS_VPN || safi == SAFI_ENCAP || safi == SAFI_MUP) {
 		for (dest = bgp_table_top(rib); dest;
 		     dest = bgp_route_next(dest)) {
 			const struct prefix *dest_p = bgp_dest_get_prefix(dest);

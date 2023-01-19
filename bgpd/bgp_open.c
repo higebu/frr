@@ -197,6 +197,12 @@ void bgp_capability_vty_out(struct vty *vty, struct peer *peer, bool use_json,
 						"capabilityErrorMultiProtocolSafi",
 						"flowspec");
 					break;
+				case SAFI_MUP:
+					json_object_string_add(
+						json_cap,
+						"capabilityErrorMultiProtocolSafi",
+						"mup");
+					break;
 				case SAFI_UNSPEC:
 				case SAFI_MAX:
 					json_object_int_add(
@@ -245,6 +251,9 @@ void bgp_capability_vty_out(struct vty *vty, struct peer *peer, bool use_json,
 					break;
 				case SAFI_EVPN:
 					vty_out(vty, "SAFI EVPN");
+					break;
+				case SAFI_MUP:
+					vty_out(vty, "SAFI MUP");
 					break;
 				case SAFI_UNSPEC:
 				case SAFI_MAX:
@@ -782,7 +791,7 @@ static int bgp_capability_enhe(struct peer *peer, struct capability_header *hdr)
 
 		if (afi != AFI_IP || nh_afi != AFI_IP6
 		    || !(safi == SAFI_UNICAST || safi == SAFI_MPLS_VPN
-			 || safi == SAFI_LABELED_UNICAST)) {
+			 || safi == SAFI_LABELED_UNICAST || safi == SAFI_MUP)) {
 			flog_warn(
 				EC_BGP_CAPABILITY_INVALID_DATA,
 				"%s Unexpected afi/safi/next-hop afi: %s/%s/%u in Extended Next-hop capability, ignoring",
@@ -1404,12 +1413,14 @@ int bgp_open_option_parse(struct peer *peer, uint16_t length,
 		    && !peer->afc_nego[AFI_IP][SAFI_MPLS_VPN]
 		    && !peer->afc_nego[AFI_IP][SAFI_ENCAP]
 		    && !peer->afc_nego[AFI_IP][SAFI_FLOWSPEC]
+		    && !peer->afc_nego[AFI_IP][SAFI_MUP]
 		    && !peer->afc_nego[AFI_IP6][SAFI_UNICAST]
 		    && !peer->afc_nego[AFI_IP6][SAFI_MULTICAST]
 		    && !peer->afc_nego[AFI_IP6][SAFI_LABELED_UNICAST]
 		    && !peer->afc_nego[AFI_IP6][SAFI_MPLS_VPN]
 		    && !peer->afc_nego[AFI_IP6][SAFI_ENCAP]
 		    && !peer->afc_nego[AFI_IP6][SAFI_FLOWSPEC]
+		    && !peer->afc_nego[AFI_IP6][SAFI_MUP]
 		    && !peer->afc_nego[AFI_L2VPN][SAFI_EVPN]) {
 			flog_err(EC_BGP_PKT_OPEN,
 				 "%s [Error] Configured AFI/SAFIs do not overlap with received MP capabilities",
@@ -1698,7 +1709,7 @@ uint16_t bgp_open_capability(struct stream *s, struct peer *peer,
 			    && peer->su.sa.sa_family == AF_INET6
 			    && afi == AFI_IP
 			    && (safi == SAFI_UNICAST || safi == SAFI_MPLS_VPN
-				|| safi == SAFI_LABELED_UNICAST)) {
+				|| safi == SAFI_LABELED_UNICAST || safi == SAFI_MUP)) {
 				/* RFC 5549 Extended Next Hop Encoding
 				 */
 				SET_FLAG(peer->cap, PEER_CAP_ENHE_ADV);

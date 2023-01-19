@@ -81,6 +81,8 @@ int str2family(const char *string)
 		return AF_ETHERNET;
 	else if (!strcmp("evpn", string))
 		return AF_EVPN;
+	else if (!strcmp("mup", string))
+		return AF_MUP;
 	return -1;
 }
 
@@ -95,6 +97,8 @@ const char *family2str(int family)
 		return "Ethernet";
 	case AF_EVPN:
 		return "Evpn";
+	case AF_MUP:
+		return "MUP";
 	}
 	return "?";
 }
@@ -174,6 +178,8 @@ const char *safi2str(safi_t safi)
 		return "labeled-unicast";
 	case SAFI_FLOWSPEC:
 		return "flowspec";
+	case SAFI_MUP:
+		return "mup";
 	case SAFI_UNSPEC:
 	case SAFI_MAX:
 		return "unknown";
@@ -347,6 +353,9 @@ void prefix_copy(union prefixptr udest, union prefixconstptr usrc)
 		dest->u.prefix_flowspec.ptr = (uintptr_t)temp;
 		memcpy((void *)dest->u.prefix_flowspec.ptr,
 		       (void *)src->u.prefix_flowspec.ptr, len);
+	} else if (src->family == AF_MUP) {
+		memcpy(&dest->u.prefix_mup, &src->u.prefix_mup,
+		       sizeof(struct mup_prefix));
 	} else {
 		flog_err(EC_LIB_DEVELOPMENT,
 			 "prefix_copy(): Unknown address family %d",
@@ -434,6 +443,11 @@ int prefix_same(union prefixconstptr up1, union prefixconstptr up2)
 			if (!memcmp(&p1->u.prefix_flowspec.ptr,
 				    &p2->u.prefix_flowspec.ptr,
 				    p2->u.prefix_flowspec.prefixlen))
+				return 1;
+		}
+		if (p1->family == AF_MUP) {
+			if (!memcmp(&p1->u.prefix_mup, &p2->u.prefix_mup,
+				    sizeof(struct mup_prefix)))
 				return 1;
 		}
 	}
@@ -567,6 +581,8 @@ const char *prefix_family_str(union prefixconstptr pu)
 		return "ether";
 	if (p->family == AF_EVPN)
 		return "evpn";
+	if (p->family == AF_MUP)
+		return "mup";
 	return "unspec";
 }
 
@@ -1072,6 +1088,88 @@ static const char *prefixevpn2str(const struct prefix_evpn *p, char *str,
 	return str;
 }
 
+static const char *prefixmup_isd2str(const struct prefix_mup *p, char *str,
+				      int size)
+{
+	uint8_t family;
+	char buf[PREFIX2STR_BUFFER];
+
+	family = IS_IPADDR_V4(&p->prefix.isd_route.ip) ? AF_INET : AF_INET6;
+	snprintf(str, size, "[%d]:[%d]:[%d]:[%s]",
+		 p->prefix.arch_type,
+		 p->prefix.route_type,
+		 p->prefix.isd_route.ip_prefix_length,
+		 inet_ntop(family, &p->prefix.isd_route.ip.ip.addr,
+			   buf, PREFIX2STR_BUFFER));
+	return str;
+}
+
+static const char *prefixmup_dsd2str(const struct prefix_mup *p, char *str,
+				      int size)
+{
+	uint8_t family;
+	char buf[PREFIX2STR_BUFFER];
+
+	family = IS_IPADDR_V4(&p->prefix.dsd_route.ip) ? AF_INET : AF_INET6;
+	snprintf(str, size, "[%d]:[%d]:[%s]",
+		 p->prefix.arch_type,
+		 p->prefix.route_type,
+		 inet_ntop(family, &p->prefix.dsd_route.ip.ip.addr,
+			   buf, PREFIX2STR_BUFFER));
+	return str;
+}
+
+static const char *prefixmup_t1st2str(const struct prefix_mup *p, char *str,
+				      int size)
+{
+	uint8_t family;
+	char buf[PREFIX2STR_BUFFER];
+
+	family = IS_IPADDR_V4(&p->prefix.t1st_route.ip) ? AF_INET : AF_INET6;
+	snprintf(str, size, "[%d]:[%d]:[%d]:[%s]",
+		 p->prefix.arch_type,
+		 p->prefix.route_type,
+		 p->prefix.t1st_route.ip_prefix_length,
+		 inet_ntop(family, &p->prefix.t1st_route.ip.ip.addr,
+			   buf, PREFIX2STR_BUFFER));
+	return str;
+}
+
+static const char *prefixmup_t2st2str(const struct prefix_mup *p, char *str,
+				      int size)
+{
+	uint8_t family;
+	char buf[PREFIX2STR_BUFFER];
+
+	family = IS_IPADDR_V4(&p->prefix.t2st_route.endpoint_address) ? AF_INET : AF_INET6;
+	snprintf(str, size, "[%d]:[%d]:[%s]:[%d]",
+		 p->prefix.arch_type,
+		 p->prefix.route_type,
+		 inet_ntop(family, &p->prefix.t2st_route.endpoint_address.ip.addr,
+			   buf, PREFIX2STR_BUFFER),
+		 p->prefix.t2st_route.teid);
+	return str;
+}
+
+static const char *prefixmup2str(const struct prefix_mup *p, char *str,
+				  int size)
+{
+	switch (p->prefix.route_type) {
+	case BGP_MUP_ISD_ROUTE:
+		return prefixmup_isd2str(p, str, size);
+	case BGP_MUP_DSD_ROUTE:
+		return prefixmup_dsd2str(p, str, size);
+	case BGP_MUP_T1ST_ROUTE:
+		return prefixmup_t1st2str(p, str, size);
+	case BGP_MUP_T2ST_ROUTE:
+		return prefixmup_t2st2str(p, str, size);
+	default:
+		snprintf(str, size, "Unsupported MUP prefix: %d", p->prefix.route_type);
+		break;
+	}
+	return str;
+}
+
 const char *prefix2str(union prefixconstptr pu, char *str, int size)
 {
 	const struct prefix *p = pu.p;
@@ -1114,6 +1212,10 @@ const char *prefix2str(union prefixconstptr pu, char *str, int size)
 
 	case AF_FLOWSPEC:
 		strlcpy(str, "FS prefix", size);
+		break;
+
+	case AF_MUP:
+		prefixmup2str((const struct prefix_mup *)p, str, size);
 		break;
 
 	default:
