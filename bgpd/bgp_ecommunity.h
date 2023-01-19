@@ -35,6 +35,7 @@
 #define ECOMMUNITY_ENCODE_OPAQUE            0x03
 #define ECOMMUNITY_ENCODE_EVPN              0x06
 #define ECOMMUNITY_ENCODE_REDIRECT_IP_NH    0x08 /* Flow Spec */
+#define ECOMMUNITY_ENCODE_MUP               0x0c
 /* Generic Transitive Experimental */
 #define ECOMMUNITY_ENCODE_TRANS_EXP         0x80
 
@@ -92,6 +93,9 @@
 
 /* Low-order octet of the Extended Communities type field for OPAQUE types */
 #define ECOMMUNITY_OPAQUE_SUBTYPE_ENCAP     0x0c
+
+/* Low-order octet of the Extended Communities type field for MUP types */
+#define ECOMMUNITY_MUP_SUBTYPE_DIRECT_SEG    0x00
 
 /* Extended communities attribute string format.  */
 #define ECOMMUNITY_FORMAT_ROUTE_MAP            0
@@ -154,6 +158,11 @@ struct ecommunity_ip6 {
 	uint16_t val;
 };
 
+struct ecommunity_mup {
+	uint16_t id2;
+	uint32_t id4;
+};
+
 /* Extended community value is eight octet.  */
 struct ecommunity_val {
 	char val[ECOMMUNITY_SIZE];
@@ -209,6 +218,22 @@ static inline void encode_route_target_as4(as_t as, uint16_t val,
 	eval->val[5] = as & 0xff;
 	eval->val[6] = (val >> 8) & 0xff;
 	eval->val[7] = val & 0xff;
+}
+
+/*
+ * Encode BGP MUP extended community.
+ */
+static inline void encode_mup_extcomm(uint16_t id2, uint32_t id4,
+					  struct ecommunity_val *eval)
+{
+	eval->val[0] = ECOMMUNITY_ENCODE_MUP;
+	eval->val[1] = ECOMMUNITY_MUP_SUBTYPE_DIRECT_SEG;
+	eval->val[2] = (id2 >> 8) & 0xff;
+	eval->val[3] = id2 & 0xff;
+	eval->val[4] = (id4 >> 24) & 0xff;
+	eval->val[5] = (id4 >> 16) & 0xff;
+	eval->val[6] = (id4 >> 8) & 0xff;
+	eval->val[7] = id4 & 0xff;
 }
 
 /* Helper function to convert uint32 to IEEE-754 Floating Point */

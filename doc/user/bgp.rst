@@ -4179,7 +4179,7 @@ structure is extended with :clicmd:`show bgp [afi] [safi]`.
 
       Total number of VRFs (including default): 3
 
-.. clicmd:: show bgp [<ipv4|ipv6> <unicast|multicast|vpn|labeled-unicast|flowspec> | l2vpn evpn]
+.. clicmd:: show bgp [<ipv4|ipv6> <unicast|multicast|vpn|labeled-unicast|flowspec|mup> | l2vpn evpn]
 
    These commands display BGP routes for the specific routing table indicated by
    the selected afi and the selected safi. If no afi and no safi value is given,

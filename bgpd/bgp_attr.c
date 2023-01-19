@@ -56,6 +56,7 @@
 #include "bgp_evpn.h"
 #include "bgp_flowspec_private.h"
 #include "bgp_mac.h"
+#include "bgp_mup.h"
 
 /* Attribute strings for logging. */
 static const struct message attr_str[] = {
@@ -4001,6 +4002,10 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 				stream_put_ipv4(s, attr->nexthop.s_addr);
 			}
 			break;
+		case SAFI_MUP:
+			stream_putc(s, 4);
+			stream_put(s, &attr->mp_nexthop_global_in, 4);
+			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			assert(!"SAFI's UNSPEC or MAX being specified are a DEV ESCAPE");
@@ -4012,7 +4017,8 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 		case SAFI_UNICAST:
 		case SAFI_MULTICAST:
 		case SAFI_LABELED_UNICAST:
-		case SAFI_EVPN: {
+		case SAFI_EVPN:
+		case SAFI_MUP: {
 			if (attr->mp_nexthop_len
 			    == BGP_ATTR_NHLEN_IPV6_GLOBAL_AND_LL) {
 				stream_putc(s,
@@ -4118,6 +4124,11 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi,
 		stream_put(s, (const void *)p->u.prefix_flowspec.ptr,
 			   p->u.prefix_flowspec.prefixlen);
 		break;
+	case SAFI_MUP:
+		/* MUP prefix - contents depend on type */
+		bgp_mup_encode_prefix(s, afi, p, prd, addpath_capable,
+				addpath_tx_id);
+		break;
 
 	case SAFI_UNICAST:
 	case SAFI_MULTICAST:
@@ -4141,6 +4152,8 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 		break;
 	case SAFI_UNICAST:
 	case SAFI_MULTICAST:
+	case SAFI_MUP:
+		size = bgp_mup_prefix_size(p);
 		break;
 	case SAFI_MPLS_VPN:
 		size += 88;
@@ -4680,7 +4693,7 @@ bgp_size_t bgp_packet_attribute(struct bgp *bgp, struct peer *peer,
 	}
 
 	/* SRv6 Service Information Attribute. */
-	if ((afi == AFI_IP || afi == AFI_IP6) && safi == SAFI_MPLS_VPN) {
+	if ((afi == AFI_IP || afi == AFI_IP6) && (safi == SAFI_MPLS_VPN || safi == SAFI_MUP)) {
 		if (attr->srv6_l3vpn) {
 			uint8_t subtlv_len =
 				BGP_PREFIX_SID_SRV6_L3_SERVICE_SID_STRUCTURE_LENGTH

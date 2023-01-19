@@ -180,6 +180,8 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 			return BGP_VPNV4_NODE;
 		case SAFI_FLOWSPEC:
 			return BGP_FLOWSPECV4_NODE;
+		case SAFI_MUP:
+			return BGP_MUPV4_NODE;
 		default:
 			/* not expected */
 			return BGP_IPV4_NODE;
@@ -196,6 +198,8 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 			return BGP_VPNV6_NODE;
 		case SAFI_FLOWSPEC:
 			return BGP_FLOWSPECV6_NODE;
+		case SAFI_MUP:
+			return BGP_MUPV6_NODE;
 		default:
 			/* not expected */
 			return BGP_IPV4_NODE;
@@ -227,6 +231,8 @@ static const char *get_afi_safi_vty_str(afi_t afi, safi_t safi)
 			return "IPv4 Encap";
 		if (safi == SAFI_FLOWSPEC)
 			return "IPv4 Flowspec";
+		if (safi == SAFI_MUP)
+			return "IPv4 MUP";
 	} else if (afi == AFI_IP6) {
 		if (safi == SAFI_UNICAST)
 			return "IPv6 Unicast";
@@ -240,6 +246,8 @@ static const char *get_afi_safi_vty_str(afi_t afi, safi_t safi)
 			return "IPv6 Encap";
 		if (safi == SAFI_FLOWSPEC)
 			return "IPv6 Flowspec";
+		if (safi == SAFI_MUP)
+			return "IPv6 MUP";
 	} else if (afi == AFI_L2VPN) {
 		if (safi == SAFI_EVPN)
 			return "L2VPN EVPN";
@@ -269,6 +277,8 @@ static const char *get_afi_safi_json_str(afi_t afi, safi_t safi)
 			return "ipv4Encap";
 		if (safi == SAFI_FLOWSPEC)
 			return "ipv4Flowspec";
+		if (safi == SAFI_MUP)
+			return "ipv4Mup";
 	} else if (afi == AFI_IP6) {
 		if (safi == SAFI_UNICAST)
 			return "ipv6Unicast";
@@ -282,6 +292,8 @@ static const char *get_afi_safi_json_str(afi_t afi, safi_t safi)
 			return "ipv6Encap";
 		if (safi == SAFI_FLOWSPEC)
 			return "ipv6Flowspec";
+		if (safi == SAFI_MUP)
+			return "ipv6Mup";
 	} else if (afi == AFI_L2VPN) {
 		if (safi == SAFI_EVPN)
 			return "l2VpnEvpn";
@@ -370,6 +382,7 @@ afi_t bgp_node_afi(struct vty *vty)
 	case BGP_IPV6L_NODE:
 	case BGP_VPNV6_NODE:
 	case BGP_FLOWSPECV6_NODE:
+	case BGP_MUPV6_NODE:
 		afi = AFI_IP6;
 		break;
 	case BGP_EVPN_NODE:
@@ -406,6 +419,10 @@ safi_t bgp_node_safi(struct vty *vty)
 	case BGP_FLOWSPECV4_NODE:
 	case BGP_FLOWSPECV6_NODE:
 		safi = SAFI_FLOWSPEC;
+		break;
+	case BGP_MUPV4_NODE:
+	case BGP_MUPV6_NODE:
+		safi = SAFI_MUP;
 		break;
 	default:
 		safi = SAFI_UNICAST;
@@ -471,6 +488,8 @@ safi_t bgp_vty_safi_from_str(const char *safi_str)
 		safi = SAFI_LABELED_UNICAST;
 	else if (strmatch(safi_str, "flowspec"))
 		safi = SAFI_FLOWSPEC;
+	else if (strmatch(safi_str, "mup"))
+		safi = SAFI_MUP;
 	return safi;
 }
 
@@ -502,6 +521,10 @@ int argv_find_and_parse_safi(struct cmd_token **argv, int argc, int *index,
 		ret = 1;
 		if (safi)
 			*safi = SAFI_FLOWSPEC;
+	} else if (argv_find(argv, argc, "mup", index)) {
+		ret = 1;
+		if (safi)
+			*safi = SAFI_MUP;
 	}
 	return ret;
 }
@@ -537,6 +560,8 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 			return "ipv4-labeled-unicast";
 		case SAFI_FLOWSPEC:
 			return "ipv4-flowspec";
+		case SAFI_MUP:
+			return "ipv4-mup";
 		default:
 			return "unknown-afi/safi";
 		}
@@ -555,6 +580,8 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 			return "ipv6-labeled-unicast";
 		case SAFI_FLOWSPEC:
 			return "ipv6-flowspec";
+		case SAFI_MUP:
+			return "ipv6-mup";
 		default:
 			return "unknown-afi/safi";
 		}
@@ -1628,6 +1655,10 @@ DEFUN (no_router_bgp,
 				    CHECK_FLAG(tmp_bgp->af_flags[AFI_IP][SAFI_UNICAST],
 					       BGP_CONFIG_VRF_TO_VRF_EXPORT) ||
 				    CHECK_FLAG(tmp_bgp->af_flags[AFI_IP6][SAFI_UNICAST],
+					       BGP_CONFIG_VRF_TO_VRF_EXPORT) ||
+				    CHECK_FLAG(tmp_bgp->af_flags[AFI_IP][SAFI_MUP],
+					       BGP_CONFIG_VRF_TO_VRF_EXPORT) ||
+				    CHECK_FLAG(tmp_bgp->af_flags[AFI_IP6][SAFI_MUP],
 					       BGP_CONFIG_VRF_TO_VRF_EXPORT) ||
 				    (bgp == bgp_get_evpn() &&
 				    (CHECK_FLAG(tmp_bgp->af_flags[AFI_L2VPN][SAFI_EVPN],
@@ -3977,11 +4008,13 @@ DEFPY(bgp_default_afi_safi, bgp_default_afi_safi_cmd,
       "ipv4-vpn|"
       "ipv4-labeled-unicast|"
       "ipv4-flowspec|"
+      "ipv4-mup|"
       "ipv6-unicast|"
       "ipv6-multicast|"
       "ipv6-vpn|"
       "ipv6-labeled-unicast|"
       "ipv6-flowspec|"
+      "ipv6-mup|"
       "l2vpn-evpn>$afi_safi",
       NO_STR
       BGP_STR
@@ -3991,11 +4024,13 @@ DEFPY(bgp_default_afi_safi, bgp_default_afi_safi_cmd,
       "Activate ipv4-vpn for a peer by default\n"
       "Activate ipv4-labeled-unicast for a peer by default\n"
       "Activate ipv4-flowspec for a peer by default\n"
+      "Activate ipv4-mup for a peer by default\n"
       "Activate ipv6-unicast for a peer by default\n"
       "Activate ipv6-multicast for a peer by default\n"
       "Activate ipv6-vpn for a peer by default\n"
       "Activate ipv6-labeled-unicast for a peer by default\n"
       "Activate ipv6-flowspec for a peer by default\n"
+      "Activate ipv6-mup for a peer by default\n"
       "Activate l2vpn-evpn for a peer by default\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
@@ -9765,7 +9800,7 @@ DEFPY (af_routetarget_import,
 
 DEFUN_NOSH (address_family_ipv4_safi,
 	address_family_ipv4_safi_cmd,
-	"address-family ipv4 [<unicast|multicast|vpn|labeled-unicast|flowspec>]",
+	"address-family ipv4 [<unicast|multicast|vpn|labeled-unicast|flowspec|mup>]",
 	"Enter Address Family command mode\n"
 	BGP_AF_STR
 	BGP_SAFI_WITH_LABEL_HELP_STR)
@@ -9776,9 +9811,9 @@ DEFUN_NOSH (address_family_ipv4_safi,
 		safi_t safi = bgp_vty_safi_from_str(argv[2]->text);
 		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT
 		    && safi != SAFI_UNICAST && safi != SAFI_MULTICAST
-		    && safi != SAFI_EVPN) {
+		    && safi != SAFI_EVPN && safi != SAFI_MUP) {
 			vty_out(vty,
-				"Only Unicast/Multicast/EVPN SAFIs supported in non-core instances.\n");
+				"Only Unicast/Multicast/EVPN/MUP SAFIs supported in non-core instances.\n");
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		vty->node = bgp_node_type(AFI_IP, safi);
@@ -9790,7 +9825,7 @@ DEFUN_NOSH (address_family_ipv4_safi,
 
 DEFUN_NOSH (address_family_ipv6_safi,
 	address_family_ipv6_safi_cmd,
-	"address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec>]",
+	"address-family ipv6 [<unicast|multicast|vpn|labeled-unicast|flowspec|mup>]",
 	"Enter Address Family command mode\n"
 	BGP_AF_STR
 	BGP_SAFI_WITH_LABEL_HELP_STR)
@@ -9800,9 +9835,9 @@ DEFUN_NOSH (address_family_ipv6_safi,
 		safi_t safi = bgp_vty_safi_from_str(argv[2]->text);
 		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT
 		    && safi != SAFI_UNICAST && safi != SAFI_MULTICAST
-		    && safi != SAFI_EVPN) {
+		    && safi != SAFI_EVPN && safi != SAFI_MUP) {
 			vty_out(vty,
-				"Only Unicast/Multicast/EVPN SAFIs supported in non-core instances.\n");
+				"Only Unicast/Multicast/EVPN/MUP SAFIs supported in non-core instances.\n");
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		vty->node = bgp_node_type(AFI_IP6, safi);
@@ -9988,7 +10023,9 @@ DEFUN_NOSH (exit_address_family,
 	    || vty->node == BGP_IPV6L_NODE || vty->node == BGP_VPNV6_NODE
 	    || vty->node == BGP_EVPN_NODE
 	    || vty->node == BGP_FLOWSPECV4_NODE
-	    || vty->node == BGP_FLOWSPECV6_NODE)
+	    || vty->node == BGP_FLOWSPECV6_NODE
+	    || vty->node == BGP_MUPV4_NODE
+	    || vty->node == BGP_MUPV6_NODE)
 		vty->node = BGP_NODE;
 	return CMD_SUCCESS;
 }
@@ -17817,6 +17854,8 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 			vty_frame(vty, "ipv4 encap");
 		else if (safi == SAFI_FLOWSPEC)
 			vty_frame(vty, "ipv4 flowspec");
+		else if (safi == SAFI_MUP)
+			vty_frame(vty, "ipv4 mup");
 	} else if (afi == AFI_IP6) {
 		if (safi == SAFI_UNICAST)
 			vty_frame(vty, "ipv6 unicast");
@@ -17830,6 +17869,8 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 			vty_frame(vty, "ipv6 encap");
 		else if (safi == SAFI_FLOWSPEC)
 			vty_frame(vty, "ipv6 flowspec");
+		else if (safi == SAFI_MUP)
+			vty_frame(vty, "ipv6 mup");
 	} else if (afi == AFI_L2VPN) {
 		if (safi == SAFI_EVPN)
 			vty_frame(vty, "l2vpn evpn");
@@ -18322,6 +18363,9 @@ int bgp_config_write(struct vty *vty)
 		/* FLOWSPEC v4 configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_IP, SAFI_FLOWSPEC);
 
+		/* BGP-MUP v4 configuration.  */
+		bgp_config_write_family(vty, bgp, AFI_IP, SAFI_MUP);
+
 		/* IPv6 unicast configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_IP6, SAFI_UNICAST);
 
@@ -18340,6 +18384,9 @@ int bgp_config_write(struct vty *vty)
 
 		/* FLOWSPEC v6 configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_IP6, SAFI_FLOWSPEC);
+
+		/* BGP-MUP v6 configuration.  */
+		bgp_config_write_family(vty, bgp, AFI_IP6, SAFI_MUP);
 
 		/* EVPN configuration.  */
 		bgp_config_write_family(vty, bgp, AFI_L2VPN, SAFI_EVPN);
@@ -18458,6 +18505,22 @@ static struct cmd_node bgp_flowspecv6_node = {
 	.node = BGP_FLOWSPECV6_NODE,
 	.parent_node = BGP_NODE,
 	.prompt = "%s(config-router-af-vpnv6)# ",
+	.no_xpath = true,
+};
+
+static struct cmd_node bgp_mupv4_node = {
+	.name = "bgp ipv4 mup",
+	.node = BGP_MUPV4_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af-mupv4)# ",
+	.no_xpath = true,
+};
+
+static struct cmd_node bgp_mupv6_node = {
+	.name = "bgp ipv6 mup",
+	.node = BGP_MUPV6_NODE,
+	.parent_node = BGP_NODE,
+	.prompt = "%s(config-router-af-mupv6)# ",
 	.no_xpath = true,
 };
 
@@ -18709,6 +18772,8 @@ void bgp_vty_init(void)
 	install_node(&bgp_evpn_vni_node);
 	install_node(&bgp_flowspecv4_node);
 	install_node(&bgp_flowspecv6_node);
+	install_node(&bgp_mupv4_node);
+	install_node(&bgp_mupv6_node);
 	install_node(&bgp_srv6_node);
 
 	/* Install default VTY commands to new nodes.  */
@@ -18725,6 +18790,8 @@ void bgp_vty_init(void)
 	install_default(BGP_FLOWSPECV6_NODE);
 	install_default(BGP_EVPN_NODE);
 	install_default(BGP_EVPN_VNI_NODE);
+	install_default(BGP_MUPV4_NODE);
+	install_default(BGP_MUPV6_NODE);
 	install_default(BGP_SRV6_NODE);
 
 	/* "global bgp inq-limit command */
@@ -19074,6 +19141,8 @@ void bgp_vty_init(void)
 	install_element(BGP_VPNV6_NODE, &neighbor_activate_cmd);
 	install_element(BGP_FLOWSPECV4_NODE, &neighbor_activate_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &neighbor_activate_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_activate_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_activate_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_activate_cmd);
 
 	/* "no neighbor activate" commands. */
@@ -19088,6 +19157,8 @@ void bgp_vty_init(void)
 	install_element(BGP_VPNV6_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_FLOWSPECV4_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &no_neighbor_activate_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_activate_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_activate_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_activate_cmd);
 
 	/* "neighbor peer-group" set commands. */
@@ -19103,6 +19174,8 @@ void bgp_vty_init(void)
 			&neighbor_set_peer_group_hidden_cmd);
 	install_element(BGP_FLOWSPECV6_NODE,
 			&neighbor_set_peer_group_hidden_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_set_peer_group_hidden_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_set_peer_group_hidden_cmd);
 
 	/* "no neighbor peer-group unset" commands. */
 	install_element(BGP_NODE, &no_neighbor_set_peer_group_cmd);
@@ -19117,6 +19190,8 @@ void bgp_vty_init(void)
 			&no_neighbor_set_peer_group_hidden_cmd);
 	install_element(BGP_FLOWSPECV6_NODE,
 			&no_neighbor_set_peer_group_hidden_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_set_peer_group_hidden_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_set_peer_group_hidden_cmd);
 
 	/* "neighbor softreconfiguration inbound" commands.*/
 	install_element(BGP_NODE, &neighbor_soft_reconfiguration_hidden_cmd);
@@ -19147,6 +19222,10 @@ void bgp_vty_init(void)
 			&no_neighbor_soft_reconfiguration_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_soft_reconfiguration_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_soft_reconfiguration_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_soft_reconfiguration_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_soft_reconfiguration_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_soft_reconfiguration_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_soft_reconfiguration_cmd);
 
 	/* "neighbor attribute-unchanged" commands.  */
 	install_element(BGP_NODE, &neighbor_attr_unchanged_hidden_cmd);
@@ -19176,6 +19255,11 @@ void bgp_vty_init(void)
 	install_element(BGP_FLOWSPECV6_NODE, &neighbor_attr_unchanged_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &no_neighbor_attr_unchanged_cmd);
 
+	install_element(BGP_MUPV4_NODE, &neighbor_attr_unchanged_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_attr_unchanged_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_attr_unchanged_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_attr_unchanged_cmd);
+
 	/* "nexthop-local unchanged" commands */
 	install_element(BGP_IPV6_NODE, &neighbor_nexthop_local_unchanged_cmd);
 	install_element(BGP_IPV6_NODE,
@@ -19202,6 +19286,10 @@ void bgp_vty_init(void)
 	install_element(BGP_VPNV6_NODE, &no_neighbor_nexthop_self_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_nexthop_self_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_nexthop_self_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_nexthop_self_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_nexthop_self_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_nexthop_self_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_nexthop_self_cmd);
 
 	/* "neighbor next-hop-self force" commands. */
 	install_element(BGP_NODE, &neighbor_nexthop_self_force_hidden_cmd);
@@ -19250,6 +19338,16 @@ void bgp_vty_init(void)
 			&no_neighbor_nexthop_self_all_hidden_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_nexthop_self_force_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_nexthop_self_force_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_nexthop_self_force_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_nexthop_self_force_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_nexthop_self_all_hidden_cmd);
+	install_element(BGP_MUPV4_NODE,
+			&no_neighbor_nexthop_self_all_hidden_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_nexthop_self_force_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_nexthop_self_force_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_nexthop_self_all_hidden_cmd);
+	install_element(BGP_MUPV6_NODE,
+			&no_neighbor_nexthop_self_all_hidden_cmd);
 
 	/* "neighbor as-override" commands. */
 	install_element(BGP_NODE, &neighbor_as_override_hidden_cmd);
@@ -19457,6 +19555,12 @@ void bgp_vty_init(void)
 			&no_neighbor_route_reflector_client_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_route_reflector_client_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_route_reflector_client_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_route_reflector_client_cmd);
+	install_element(BGP_MUPV4_NODE,
+			&no_neighbor_route_reflector_client_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_route_reflector_client_cmd);
+	install_element(BGP_MUPV6_NODE,
+			&no_neighbor_route_reflector_client_cmd);
 
 	/* "optimal-route-reflection" commands */
 	install_element(BGP_IPV4_NODE, &optimal_route_reflection_cmd);
@@ -19470,6 +19574,8 @@ void bgp_vty_init(void)
 	install_element(BGP_FLOWSPECV4_NODE, &optimal_route_reflection_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &optimal_route_reflection_cmd);
 	install_element(BGP_EVPN_NODE, &optimal_route_reflection_cmd);
+	install_element(BGP_MUPV4_NODE, &optimal_route_reflection_cmd);
+	install_element(BGP_MUPV6_NODE, &optimal_route_reflection_cmd);
 
 	/* "neighbor optimal-route-reflection" commands */
 	install_element(BGP_IPV4_NODE, &neighbor_optimal_route_reflection_cmd);
@@ -19485,6 +19591,8 @@ void bgp_vty_init(void)
 	install_element(BGP_FLOWSPECV6_NODE,
 			&neighbor_optimal_route_reflection_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_optimal_route_reflection_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_optimal_route_reflection_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_optimal_route_reflection_cmd);
 
 	/* "neighbor route-server" commands.*/
 	install_element(BGP_NODE, &neighbor_route_server_client_hidden_cmd);
@@ -19513,6 +19621,10 @@ void bgp_vty_init(void)
 	install_element(BGP_FLOWSPECV6_NODE, &neighbor_route_server_client_cmd);
 	install_element(BGP_FLOWSPECV6_NODE,
 			&no_neighbor_route_server_client_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_route_server_client_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_route_server_client_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_route_server_client_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_route_server_client_cmd);
 
 	/* "neighbor disable-addpath-rx" commands. */
 	install_element(BGP_IPV4_NODE, &neighbor_disable_addpath_rx_cmd);
@@ -19790,6 +19902,10 @@ void bgp_vty_init(void)
 	install_element(BGP_FLOWSPECV4_NODE, &no_neighbor_prefix_list_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &neighbor_prefix_list_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &no_neighbor_prefix_list_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_prefix_list_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_prefix_list_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_prefix_list_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_prefix_list_cmd);
 
 	/* "neighbor filter-list" commands. */
 	install_element(BGP_NODE, &neighbor_filter_list_hidden_cmd);
@@ -19814,6 +19930,10 @@ void bgp_vty_init(void)
 	install_element(BGP_FLOWSPECV4_NODE, &no_neighbor_filter_list_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &neighbor_filter_list_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &no_neighbor_filter_list_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_filter_list_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_filter_list_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_filter_list_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_filter_list_cmd);
 
 	/* "neighbor route-map" commands. */
 	install_element(BGP_NODE, &neighbor_route_map_hidden_cmd);
@@ -19840,6 +19960,10 @@ void bgp_vty_init(void)
 	install_element(BGP_FLOWSPECV6_NODE, &no_neighbor_route_map_cmd);
 	install_element(BGP_EVPN_NODE, &neighbor_route_map_cmd);
 	install_element(BGP_EVPN_NODE, &no_neighbor_route_map_cmd);
+	install_element(BGP_MUPV4_NODE, &neighbor_route_map_cmd);
+	install_element(BGP_MUPV4_NODE, &no_neighbor_route_map_cmd);
+	install_element(BGP_MUPV6_NODE, &neighbor_route_map_cmd);
+	install_element(BGP_MUPV6_NODE, &no_neighbor_route_map_cmd);
 
 	/* "neighbor unsuppress-map" commands. */
 	install_element(BGP_NODE, &neighbor_unsuppress_map_hidden_cmd);
@@ -20045,6 +20169,8 @@ void bgp_vty_init(void)
 	install_element(BGP_FLOWSPECV4_NODE, &exit_address_family_cmd);
 	install_element(BGP_FLOWSPECV6_NODE, &exit_address_family_cmd);
 	install_element(BGP_EVPN_NODE, &exit_address_family_cmd);
+	install_element(BGP_MUPV4_NODE, &exit_address_family_cmd);
+	install_element(BGP_MUPV6_NODE, &exit_address_family_cmd);
 
 	/* BGP retain all route-target */
 	install_element(BGP_VPNV4_NODE, &bgp_retain_route_target_cmd);

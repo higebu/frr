@@ -38,10 +38,10 @@ struct bgp;
 #define BGP_AFI_SAFI_CMD_STR    BGP_AFI_CMD_STR" "BGP_SAFI_CMD_STR
 #define BGP_AFI_SAFI_HELP_STR   BGP_AFI_HELP_STR BGP_SAFI_HELP_STR
 
-#define BGP_SAFI_WITH_LABEL_CMD_STR  "<unicast|multicast|vpn|labeled-unicast|flowspec>"
+#define BGP_SAFI_WITH_LABEL_CMD_STR  "<unicast|multicast|vpn|labeled-unicast|flowspec|mup>"
 #define BGP_SAFI_WITH_LABEL_HELP_STR                                           \
 	BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR            \
-		BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR
+		BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR BGP_AF_MODIFIER_STR
 
 #define SHOW_GR_HEADER \
 	"Codes: GR - Graceful Restart," \
