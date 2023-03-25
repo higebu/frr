@@ -284,6 +284,7 @@ static int bgp_mup_process_t1st_route(struct peer *peer, afi_t afi, safi_t safi,
 	struct prefix_mup p = {};
 	uint8_t prefix_len, endpoint_address_len;
 	int ret = 0;
+	uint32_t teid;
 
 	if (psize < 9) {
 		flog_err(EC_BGP_MUP_ROUTE_INVALID,
@@ -302,6 +303,7 @@ static int bgp_mup_process_t1st_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Make MUP prefix. */
 	p.family = AF_MUP;
+        p.prefixlen = BGP_MUP_ROUTE_PREFIXLEN;
 	p.prefix.arch_type = BGP_MUP_ARCH_3GPP_5G;
 	p.prefix.route_type = BGP_MUP_T1ST_ROUTE;
 
@@ -330,7 +332,8 @@ static int bgp_mup_process_t1st_route(struct peer *peer, afi_t afi, safi_t safi,
 	STREAM_GET(&p.prefix.t1st_route.ip.ip.addr, data, prefix_len);
 
 	/* TEID (4 octets) */
-	STREAM_GET(&p.prefix.t1st_route.t1st_3gpp_5g.teid, data, 4);
+	STREAM_GET(&teid, data, 4);
+	p.prefix.t1st_route.t1st_3gpp_5g.teid = teid;
 	/* QFI (1 octet) */
 	STREAM_GETC(data, p.prefix.t1st_route.t1st_3gpp_5g.qfi);
 	/* Endpoint Address Length (1 octet) */
@@ -373,6 +376,8 @@ static int bgp_mup_process_t2st_route(struct peer *peer, afi_t afi, safi_t safi,
 	uint8_t endpoint_address_len;
 	int ipa_len;
 	int ret = 0;
+	uint32_t teid;
+	uint32_t teid_len;
 
 	if (psize < 9) {
 		flog_err(EC_BGP_MUP_ROUTE_INVALID,
@@ -391,6 +396,7 @@ static int bgp_mup_process_t2st_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Make MUP prefix. */
 	p.family = AF_MUP;
+	p.prefixlen = BGP_MUP_ROUTE_PREFIXLEN;
 	p.prefix.arch_type = BGP_MUP_ARCH_3GPP_5G;
 	p.prefix.route_type = BGP_MUP_T2ST_ROUTE;
 
@@ -413,14 +419,17 @@ static int bgp_mup_process_t2st_route(struct peer *peer, afi_t afi, safi_t safi,
 	if (afi == AFI_IP) {
 		p.prefix.t2st_route.endpoint_address.ipa_type = IPADDR_V4;
 		ipa_len = IPV4_MAX_BYTELEN;
+		teid_len = endpoint_address_len - IPV4_MAX_BYTELEN * 8;
 	} else {
 		p.prefix.t2st_route.endpoint_address.ipa_type = IPADDR_V6;
 		ipa_len = IPV6_MAX_BYTELEN;
+		teid_len = endpoint_address_len - IPV6_MAX_BYTELEN * 8;
 	}
 	STREAM_GET(&p.prefix.t2st_route.endpoint_address.ip.addr, data, ipa_len);
 
 	/* TEID (4 octets) */
-	STREAM_GET(&p.prefix.t2st_route.teid, data, 4);
+	STREAM_GET(&teid, data, teid_len/8);
+	p.prefix.t2st_route.teid = ntohl(teid);
 
 	/* Process the route. */
 	if (attr)
@@ -498,6 +507,7 @@ int bgp_nlri_parse_mup(struct peer *peer, struct attr *attr,
 		if (pnt + psize > lim)
 			return BGP_NLRI_PARSE_ERROR_PACKET_OVERFLOW;
 
+		zlog_debug("rtype: %d", rtype);
 		switch (rtype) {
 		case BGP_MUP_ISD_ROUTE: /* Interwork Segment Discovery route */
 			if (bgp_mup_process_isd_route(peer, afi, safi,
