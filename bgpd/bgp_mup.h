@@ -24,6 +24,8 @@
 
 #include "bgpd/bgpd.h"
 
+#define BGP_MUP_ROUTE_PREFIXLEN (sizeof(struct mup_prefix) * 8)
+
 extern size_t bgp_mup_prefix_size(const struct prefix *p);
 
 extern void bgp_mup_encode_prefix(struct stream *s, afi_t afi,
