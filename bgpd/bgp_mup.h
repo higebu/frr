@@ -25,6 +25,7 @@
 #include "bgpd/bgpd.h"
 
 #define BGP_MUP_ROUTE_PREFIXLEN (sizeof(struct mup_prefix) * 8)
+#define BGP_MUP_ROUTE_T1ST_PREFIXLEN ((sizeof(struct mup_prefix) - sizeof(struct mup_t1st_route)) * 8)
 
 extern size_t bgp_mup_prefix_size(const struct prefix *p);
 

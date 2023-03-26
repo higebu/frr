@@ -209,7 +209,7 @@ struct mup_t2st_route {
 	uint32_t teid; /* Architecture Type: 3gpp-5g */
 };
 
-/* MUP prefix (draft-mpmz-bess-mup-safi-01) */
+/* MUP prefix (draft-mpmz-bess-mup-safi-02) */
 struct mup_prefix {
 	uint8_t arch_type;
 	uint16_t route_type;

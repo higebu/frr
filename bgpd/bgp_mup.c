@@ -157,6 +157,7 @@ static int bgp_mup_process_isd_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Make MUP prefix. */
 	p.family = AF_MUP;
+	p.prefixlen = BGP_MUP_ROUTE_PREFIXLEN;
 	p.prefix.arch_type = BGP_MUP_ARCH_3GPP_5G;
 	p.prefix.route_type = BGP_MUP_ISD_ROUTE;
 
@@ -240,6 +241,7 @@ static int bgp_mup_process_dsd_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Make MUP prefix. */
 	p.family = AF_MUP;
+	p.prefixlen = BGP_MUP_ROUTE_PREFIXLEN;
 	p.prefix.arch_type = BGP_MUP_ARCH_3GPP_5G;
 	p.prefix.route_type = BGP_MUP_DSD_ROUTE;
 
@@ -303,7 +305,7 @@ static int bgp_mup_process_t1st_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Make MUP prefix. */
 	p.family = AF_MUP;
-        p.prefixlen = BGP_MUP_ROUTE_PREFIXLEN;
+	p.prefixlen = BGP_MUP_ROUTE_T1ST_PREFIXLEN;
 	p.prefix.arch_type = BGP_MUP_ARCH_3GPP_5G;
 	p.prefix.route_type = BGP_MUP_T1ST_ROUTE;
 
@@ -507,7 +509,6 @@ int bgp_nlri_parse_mup(struct peer *peer, struct attr *attr,
 		if (pnt + psize > lim)
 			return BGP_NLRI_PARSE_ERROR_PACKET_OVERFLOW;
 
-		zlog_debug("rtype: %d", rtype);
 		switch (rtype) {
 		case BGP_MUP_ISD_ROUTE: /* Interwork Segment Discovery route */
 			if (bgp_mup_process_isd_route(peer, afi, safi,
