@@ -43,7 +43,7 @@ void bgp_mup_encode_prefix(struct stream *s, afi_t afi, const struct prefix *p,
 			   uint32_t addpath_tx_id)
 {
 	struct prefix_mup *mp = (struct prefix_mup *)p;
-	int len, ipa_len = 0;
+	int len, ipa_len, end_ipa_length = 0;
 
 	if (addpath_capable)
 		stream_putl(s, addpath_tx_id);
@@ -79,6 +79,7 @@ void bgp_mup_encode_prefix(struct stream *s, afi_t afi, const struct prefix *p,
 
 	case BGP_MUP_T1ST_ROUTE: /* Type 1 Session Transformed (ST) route */
 		ipa_len = PSIZE(mp->prefix.t1st_route.ip_prefix_length);
+		end_ipa_length = PSIZE(mp->prefix.t1st_route.t1st_3gpp_5g.endpoint_address_length);
 		if (IS_IPADDR_V4(&mp->prefix.t1st_route.t1st_3gpp_5g
 					  .endpoint_address))
 			len = 4;
@@ -86,7 +87,7 @@ void bgp_mup_encode_prefix(struct stream *s, afi_t afi, const struct prefix *p,
 			len = 16;
 		/* RD, Prefix Length, Prefix, TEID, QFI, Endpoint Address Length
 		 */
-		len += 8 + 1 + ipa_len + 4 + 1 + 1;
+		len += 8 + 1 + ipa_len + 4 + 1 + 1 + end_ipa_length;
 		stream_putc(s, len);
 		stream_put(s, prd->val, 8); /* RD */
 		stream_putc(s, mp->prefix.t1st_route
@@ -305,7 +306,7 @@ static int bgp_mup_process_t1st_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Make MUP prefix. */
 	p.family = AF_MUP;
-	p.prefixlen = BGP_MUP_ROUTE_T1ST_PREFIXLEN;
+	p.prefixlen = BGP_MUP_ROUTE_PREFIXLEN;
 	p.prefix.arch_type = BGP_MUP_ARCH_3GPP_5G;
 	p.prefix.route_type = BGP_MUP_T1ST_ROUTE;
 
