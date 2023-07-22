@@ -194,11 +194,11 @@ static int bgp_mup_process_isd_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Process the route. */
 	if (attr)
-		ret = bgp_update(peer, (struct prefix *)&p, addpath_id, attr,
+		bgp_update(peer, (struct prefix *)&p, addpath_id, attr,
 				 afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				 &prd, NULL, 0, 0, NULL);
 	else
-		ret = bgp_withdraw(peer, (struct prefix *)&p, addpath_id, attr,
+		bgp_withdraw(peer, (struct prefix *)&p, addpath_id,
 				   afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				   &prd, NULL, 0, NULL);
 	goto done;
@@ -257,11 +257,11 @@ static int bgp_mup_process_dsd_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Process the route. */
 	if (attr)
-		ret = bgp_update(peer, (struct prefix *)&p, addpath_id, attr,
+		bgp_update(peer, (struct prefix *)&p, addpath_id, attr,
 				 afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				 &prd, NULL, 0, 0, NULL);
 	else
-		ret = bgp_withdraw(peer, (struct prefix *)&p, addpath_id, attr,
+		bgp_withdraw(peer, (struct prefix *)&p, addpath_id,
 				   afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				   &prd, NULL, 0, NULL);
 	goto done;
@@ -348,11 +348,11 @@ static int bgp_mup_process_t1st_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Process the route. */
 	if (attr)
-		ret = bgp_update(peer, (struct prefix *)&p, addpath_id, attr,
+		bgp_update(peer, (struct prefix *)&p, addpath_id, attr,
 				 afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				 &prd, NULL, 0, 0, NULL);
 	else
-		ret = bgp_withdraw(peer, (struct prefix *)&p, addpath_id, attr,
+		bgp_withdraw(peer, (struct prefix *)&p, addpath_id,
 				   afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				   &prd, NULL, 0, NULL);
 	goto done;
@@ -436,11 +436,11 @@ static int bgp_mup_process_t2st_route(struct peer *peer, afi_t afi, safi_t safi,
 
 	/* Process the route. */
 	if (attr)
-		ret = bgp_update(peer, (struct prefix *)&p, addpath_id, attr,
+		bgp_update(peer, (struct prefix *)&p, addpath_id, attr,
 				 afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				 &prd, NULL, 0, 0, NULL);
 	else
-		ret = bgp_withdraw(peer, (struct prefix *)&p, addpath_id, attr,
+		bgp_withdraw(peer, (struct prefix *)&p, addpath_id,
 				   afi, safi, ZEBRA_ROUTE_BGP, BGP_ROUTE_NORMAL,
 				   &prd, NULL, 0, NULL);
 	goto done;

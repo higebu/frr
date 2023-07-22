@@ -168,18 +168,12 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 			return BGP_VPNV4_NODE;
 		case SAFI_FLOWSPEC:
 			return BGP_FLOWSPECV4_NODE;
-<<<<<<< HEAD
+		case SAFI_MUP:
+			return BGP_MUPV4_NODE;
 		case SAFI_UNSPEC:
 		case SAFI_ENCAP:
 		case SAFI_EVPN:
 		case SAFI_MAX:
-||||||| parent of b6b3ee4b1 (wip: lib,bgpd: initial support for BGP-MUP SAFI)
-		default:
-=======
-		case SAFI_MUP:
-			return BGP_MUPV4_NODE;
-		default:
->>>>>>> b6b3ee4b1 (wip: lib,bgpd: initial support for BGP-MUP SAFI)
 			/* not expected */
 			return BGP_IPV4_NODE;
 		}
@@ -196,21 +190,13 @@ static enum node_type bgp_node_type(afi_t afi, safi_t safi)
 			return BGP_VPNV6_NODE;
 		case SAFI_FLOWSPEC:
 			return BGP_FLOWSPECV6_NODE;
-<<<<<<< HEAD
+		case SAFI_MUP:
+			return BGP_MUPV6_NODE;
 		case SAFI_UNSPEC:
 		case SAFI_ENCAP:
 		case SAFI_EVPN:
 		case SAFI_MAX:
 			/* not expected and the return value seems wrong */
-||||||| parent of b6b3ee4b1 (wip: lib,bgpd: initial support for BGP-MUP SAFI)
-		default:
-			/* not expected */
-=======
-		case SAFI_MUP:
-			return BGP_MUPV6_NODE;
-		default:
-			/* not expected */
->>>>>>> b6b3ee4b1 (wip: lib,bgpd: initial support for BGP-MUP SAFI)
 			return BGP_IPV4_NODE;
 		}
 		break;
@@ -610,6 +596,7 @@ static const char *get_bgp_default_af_flag(afi_t afi, safi_t safi)
 		case SAFI_ENCAP:
 		case SAFI_LABELED_UNICAST:
 		case SAFI_FLOWSPEC:
+		case SAFI_MUP:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return "unknown-afi/safi";
@@ -20052,38 +20039,6 @@ void bgp_vty_init(void)
 	install_element(BGP_MUPV6_NODE, &neighbor_route_reflector_client_cmd);
 	install_element(BGP_MUPV6_NODE,
 			&no_neighbor_route_reflector_client_cmd);
-
-	/* "optimal-route-reflection" commands */
-	install_element(BGP_IPV4_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_IPV4M_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_IPV4L_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_IPV6_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_IPV6M_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_IPV6L_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_VPNV4_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_VPNV6_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_FLOWSPECV4_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_FLOWSPECV6_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_EVPN_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_MUPV4_NODE, &optimal_route_reflection_cmd);
-	install_element(BGP_MUPV6_NODE, &optimal_route_reflection_cmd);
-
-	/* "neighbor optimal-route-reflection" commands */
-	install_element(BGP_IPV4_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_IPV4M_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_IPV4L_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_IPV6_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_IPV6M_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_IPV6L_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_VPNV4_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_VPNV6_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_FLOWSPECV4_NODE,
-			&neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_FLOWSPECV6_NODE,
-			&neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_EVPN_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_MUPV4_NODE, &neighbor_optimal_route_reflection_cmd);
-	install_element(BGP_MUPV6_NODE, &neighbor_optimal_route_reflection_cmd);
 
 	/* "neighbor route-server" commands.*/
 	install_element(BGP_NODE, &neighbor_route_server_client_hidden_cmd);
