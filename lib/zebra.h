@@ -184,7 +184,8 @@ typedef enum {
 	SAFI_LABELED_UNICAST = 6,
 	SAFI_FLOWSPEC = 7,
 	SAFI_BGP_LS = 8, /* BGP-LS (RFC 9552) */
-	SAFI_MAX = 9
+	SAFI_MUP = 9,	 /* BGP-MUP (draft-ietf-bess-mup-safi) */
+	SAFI_MAX = 10
 } safi_t;
 
 #define FOREACH_AFI_SAFI(afi, safi)                                            \
@@ -193,7 +194,8 @@ typedef enum {
 
 #define FOREACH_AFI_SAFI_NSF(afi, safi)                                                           \
 	for (afi = AFI_IP; afi < AFI_MAX; afi++)                                                  \
-		for (safi = SAFI_UNICAST; safi <= SAFI_EVPN; safi++)
+		for (safi = SAFI_UNICAST; safi < SAFI_MAX; safi++)                                \
+			if (safi <= SAFI_EVPN || safi == SAFI_MUP)
 
 /* Flag manipulation macros. */
 #define CHECK_FLAG(V,F)      ((V) & (F))
