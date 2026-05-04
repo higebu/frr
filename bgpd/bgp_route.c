@@ -18900,6 +18900,12 @@ void bgp_route_init(void)
 	install_element(BGP_IPV6L_NODE, &ipv6_bgp_network_cmd);
 	install_element(BGP_IPV6L_NODE, &aggregate_addressv6_cmd);
 
+	/* BGP-MUP: `network` injects into the (vrf, afi, SAFI_MUP) RIB
+	 * as locally-originated; that set is the ISD origination source.
+	 */
+	install_element(BGP_IPV4_MUP_NODE, &bgp_network_cmd);
+	install_element(BGP_IPV6_MUP_NODE, &ipv6_bgp_network_cmd);
+
 	install_element(BGP_NODE, &bgp_distance_cmd);
 	install_element(BGP_NODE, &no_bgp_distance_cmd);
 	install_element(BGP_NODE, &bgp_distance_source_cmd);
