@@ -43,6 +43,7 @@
 #include "bgp_vnc_types.h"
 #endif
 #include "bgp_evpn.h"
+#include "bgp_mup.h"
 #include "bgp_flowspec_private.h"
 #include "bgp_mac.h"
 #include "bgpd/bgp_ls_nlri.h"
@@ -5075,7 +5076,7 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi, const st
 		assert(!"Please add proper encoding of SAFI_ENCAP");
 		break;
 	case SAFI_MUP:
-		/* TODO: implemented in subsequent commit */
+		bgp_mup_encode_prefix(s, afi, p, prd, addpath_capable, addpath_tx_id);
 		break;
 	}
 }
@@ -5121,8 +5122,7 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 		size = 0;
 		break;
 	case SAFI_MUP:
-		/* TODO: implemented in subsequent commit */
-		size = 0;
+		size = bgp_mup_prefix_size(p);
 		break;
 	}
 
