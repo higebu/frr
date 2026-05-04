@@ -14705,6 +14705,16 @@ const struct prefix_rd *bgp_rd_from_dest(const struct bgp_dest *dest,
 	case SAFI_ENCAP:
 	case SAFI_EVPN:
 		return (struct prefix_rd *)(bgp_dest_get_prefix(dest));
+	case SAFI_MUP:
+		/*
+		 * SAFI_MUP keys the RIB on struct prefix_mup, which embeds
+		 * the RD inside prefix.rd[8] at a different offset from
+		 * struct prefix_rd.val[8].  Casting the dest's prefix to
+		 * prefix_rd would return bytes from the arch_type / route_type
+		 * / length header instead of the RD.  Callers wanting the RD
+		 * for a SAFI_MUP route should extract it from prefix_mup.
+		 */
+		return NULL;
 	case SAFI_BGP_LS:
 	case SAFI_UNSPEC:
 	case SAFI_UNICAST:

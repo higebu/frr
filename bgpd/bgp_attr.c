@@ -4801,6 +4801,14 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 			stream_putc(s, IPV4_MAX_BYTELEN);
 			stream_put_ipv4(s, attr->mp_nexthop_global_in.s_addr);
 			break;
+		case SAFI_MUP:
+			/* draft-ietf-bess-mup-safi: nexthop is the IPv6 address
+			 * of the originating PE / MUP Controller. AFI=IPv4 MUP
+			 * routes still carry an IPv6 nexthop.
+			 */
+			stream_putc(s, IPV6_MAX_BYTELEN);
+			stream_put(s, &attr->mp_nexthop_global, IPV6_MAX_BYTELEN);
+			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			assert(!"SAFI's UNSPEC or MAX being specified are a DEV ESCAPE");
@@ -4860,6 +4868,10 @@ size_t bgp_packet_mpattr_start(struct stream *s, struct peer *peer, afi_t afi,
 			stream_put(s, &attr->mp_nexthop_global, IPV6_MAX_BYTELEN);
 			if (attr->mp_nexthop_len == BGP_ATTR_NHLEN_IPV6_GLOBAL_AND_LL)
 				stream_put(s, &attr->mp_nexthop_local, IPV6_MAX_BYTELEN);
+			break;
+		case SAFI_MUP:
+			stream_putc(s, IPV6_MAX_BYTELEN);
+			stream_put(s, &attr->mp_nexthop_global, IPV6_MAX_BYTELEN);
 			break;
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
@@ -5062,6 +5074,9 @@ void bgp_packet_mpattr_prefix(struct stream *s, afi_t afi, safi_t safi, const st
 	case SAFI_ENCAP:
 		assert(!"Please add proper encoding of SAFI_ENCAP");
 		break;
+	case SAFI_MUP:
+		/* TODO: implemented in subsequent commit */
+		break;
 	}
 }
 
@@ -5103,6 +5118,10 @@ size_t bgp_packet_mpattr_prefix_size(afi_t afi, safi_t safi,
 		break;
 	case SAFI_BGP_LS:
 		/* TODO: add explaination */
+		size = 0;
+		break;
+	case SAFI_MUP:
+		/* TODO: implemented in subsequent commit */
 		size = 0;
 		break;
 	}

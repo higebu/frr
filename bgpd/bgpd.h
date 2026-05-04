@@ -107,6 +107,8 @@ enum bgp_af_index {
 	BGP_AF_IPV4_FLOWSPEC,
 	BGP_AF_IPV6_FLOWSPEC,
 	BGP_AF_BGP_LS,
+	BGP_AF_IPV4_MUP,
+	BGP_AF_IPV6_MUP,
 	BGP_AF_MAX
 };
 
@@ -3003,6 +3005,8 @@ static inline int afindex(afi_t afi, safi_t safi)
 			return BGP_AF_IPV4_ENCAP;
 		case SAFI_FLOWSPEC:
 			return BGP_AF_IPV4_FLOWSPEC;
+		case SAFI_MUP:
+			return BGP_AF_IPV4_MUP;
 		case SAFI_BGP_LS:
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
@@ -3024,6 +3028,8 @@ static inline int afindex(afi_t afi, safi_t safi)
 			return BGP_AF_IPV6_ENCAP;
 		case SAFI_FLOWSPEC:
 			return BGP_AF_IPV6_FLOWSPEC;
+		case SAFI_MUP:
+			return BGP_AF_IPV6_MUP;
 		case SAFI_BGP_LS:
 		case SAFI_EVPN:
 		case SAFI_UNSPEC:
@@ -3042,6 +3048,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_MPLS_VPN:
 		case SAFI_ENCAP:
 		case SAFI_FLOWSPEC:
+		case SAFI_MUP:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return BGP_AF_MAX;
@@ -3058,6 +3065,7 @@ static inline int afindex(afi_t afi, safi_t safi)
 		case SAFI_ENCAP:
 		case SAFI_EVPN:
 		case SAFI_FLOWSPEC:
+		case SAFI_MUP:
 		case SAFI_UNSPEC:
 		case SAFI_MAX:
 			return BGP_AF_MAX;
@@ -3299,11 +3307,17 @@ static inline bool bgp_gr_is_forwarding_preserved(struct bgp *bgp)
 static inline bool bgp_gr_supported_for_afi_safi(afi_t afi, safi_t safi)
 {
 	/*
-	 * GR restarter behavior is supported only for IPv4-unicast,
-	 * IPv6-unicast and L2vpn EVPN
+	 * GR is supported for IPv4-unicast, IPv6-unicast, L2VPN EVPN and
+	 * BGP-MUP.  This gates both the GR address-family capability the
+	 * speaker advertises (bgp_open.c) and the helper-side stale-route
+	 * preservation (bgp_fsm.c).  draft-ietf-bess-mup-safi makes no
+	 * GR-specific exclusion; MUP installs are FIB-side per-(vrf, T1ST/
+	 * T2ST endpoint) state that should survive a peer flap the same
+	 * way unicast prefixes do.
 	 */
 	if ((afi == AFI_IP && safi == SAFI_UNICAST) || (afi == AFI_IP6 && safi == SAFI_UNICAST) ||
-	    (afi == AFI_L2VPN && safi == SAFI_EVPN))
+	    (afi == AFI_L2VPN && safi == SAFI_EVPN) ||
+	    ((afi == AFI_IP || afi == AFI_IP6) && safi == SAFI_MUP))
 		return true;
 	return false;
 }
