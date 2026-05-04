@@ -107,6 +107,8 @@ static struct in_addr ipv4_ll;
 
 static int netlink_nexthop_msg_encode_end_b6_encaps(struct nlmsghdr *nlmsg,
 						    const struct nexthop *nh, size_t buflen);
+static ssize_t fill_srh_end_b6_encaps(char *buffer, size_t buflen,
+				      struct seg6_seg_stack *segs);
 
 /* Is this a ipv4 over ipv6 route? */
 static bool is_route_v4_over_v6(unsigned char rtm_family,
@@ -2013,6 +2015,144 @@ static bool _netlink_nexthop_encode_seg6local_info(const struct nexthop *nexthop
 		if (!netlink_nexthop_msg_encode_end_b6_encaps(nlmsg, nexthop, buflen))
 			return false;
 		break;
+#ifndef SEG6_LOCAL_ACTION_END_M_GTP4_E
+	/*
+	 * SRv6 Mobile User Plane (RFC 9433) - mirrors the seg6_local
+	 * action_table on higebu/linux:b4/seg6-mobile.  Kernel attribute
+	 * IDs for SEG6_LOCAL_MOBILE_* land at 12..16; we provide local
+	 * fallback values when the host kernel headers do not yet expose
+	 * them so frr can be built ahead of UAPI ship.
+	 */
+#define SEG6_LOCAL_ACTION_END_MAP	  17
+#define SEG6_LOCAL_ACTION_END_M_GTP4_E	  18
+#define SEG6_LOCAL_ACTION_END_M_GTP6_E	  19
+#define SEG6_LOCAL_ACTION_END_M_GTP6_D	  20
+#define SEG6_LOCAL_ACTION_END_M_GTP6_D_DI 21
+#define SEG6_LOCAL_ACTION_H_M_GTP4_D	  22
+#endif
+#ifndef SEG6_LOCAL_MOBILE_SRC_ADDR
+/* Match the kernel UAPI on higebu/linux:b4/seg6-mobile.  These attribute
+ * IDs come right after SEG6_LOCAL_FLAVORS (= 11), so they start at 12.
+ * The previous values (13, 14, ...) were off by one and produced
+ * netlink RTM_NEWROUTE messages the kernel rejected with -EINVAL
+ * (kernel saw MOBILE_SRC_ADDR's 16-byte payload at the slot reserved
+ * for MOBILE_V4_MASK_LEN, which expects NLA_U8).
+ */
+#define SEG6_LOCAL_MOBILE_SRC_ADDR	    12
+#define SEG6_LOCAL_MOBILE_V4_MASK_LEN	    13
+#define SEG6_LOCAL_MOBILE_PDU_TYPE	    14
+#define SEG6_LOCAL_MOBILE_V6_SRC_PREFIX_LEN 15
+#define SEG6_LOCAL_MOBILE_SR_PREFIX_LEN	    16
+#endif
+	case ZEBRA_SEG6_LOCAL_ACTION_END_MAP:
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_LOCAL_ACTION, SEG6_LOCAL_ACTION_END_MAP))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_LOCAL_NH6, &ctx->nh6, sizeof(struct in6_addr)))
+			return false;
+		break;
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP4_E:
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_LOCAL_ACTION,
+				   SEG6_LOCAL_ACTION_END_M_GTP4_E))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_LOCAL_MOBILE_SRC_ADDR, &ctx->mobile.src_addr,
+				 sizeof(struct in6_addr)))
+			return false;
+		if (!nl_attr_put8(nlmsg, buflen, SEG6_LOCAL_MOBILE_V4_MASK_LEN,
+				  ctx->mobile.v4_mask_len))
+			return false;
+		/*
+		 * RFC 9433 Section 6.6: End.M.GTP4.E reads the IPv4 source for
+		 * the egress GTP-U packet from the SRv6 source address
+		 * starting at v6_src_prefix_len.  Without this attribute
+		 * the kernel emits the GTP-U with src=0.0.0.0 and gNB
+		 * silently drops the response.
+		 */
+		if (ctx->mobile.v6_src_prefix_len &&
+		    !nl_attr_put8(nlmsg, buflen, SEG6_LOCAL_MOBILE_V6_SRC_PREFIX_LEN,
+				  ctx->mobile.v6_src_prefix_len))
+			return false;
+		/*
+		 * SEG6_LOCAL_OIF binds the kernel's post-action route
+		 * lookup (flowi4_oif) to the per-vrf loopback so the
+		 * rebuilt GTP-U packet resolves in the slice's vrf table
+		 * instead of main.  Listed as optattr in net/ipv6/seg6_local.c
+		 * (struct seg6_local_lwt for END_M_GTP4_E).
+		 */
+		if (ctx->ifindex &&
+		    !nl_attr_put32(nlmsg, buflen, SEG6_LOCAL_OIF, ctx->ifindex))
+			return false;
+		break;
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_E:
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_LOCAL_ACTION,
+				   SEG6_LOCAL_ACTION_END_M_GTP6_E))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_LOCAL_MOBILE_SRC_ADDR, &ctx->mobile.src_addr,
+				 sizeof(struct in6_addr)))
+			return false;
+		/* See END_M_GTP4_E above: post-action seg6_lookup_any_nexthop
+		 * needs slwt->oif to honour the per-vrf scope.
+		 */
+		if (ctx->ifindex &&
+		    !nl_attr_put32(nlmsg, buflen, SEG6_LOCAL_OIF, ctx->ifindex))
+			return false;
+		break;
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D_DI: {
+		uint32_t kaction = (nexthop->nh_srv6->seg6local_action ==
+					    ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D)
+					   ? SEG6_LOCAL_ACTION_END_M_GTP6_D
+					   : SEG6_LOCAL_ACTION_END_M_GTP6_D_DI;
+		char srh_buf[4096];
+		ssize_t srh_len;
+
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_LOCAL_ACTION, kaction))
+			return false;
+		/* End.M.GTP{6.D, 6.D.Di} require an SR Policy SRH carried in
+		 * SEG6_LOCAL_SRH (kernel build_state rejects without it).
+		 * The SR policy is populated in nh_srv6->seg6_segs by the
+		 * caller; synthesise a packed SRH the same way the
+		 * End.B6.Encap encoder does.
+		 */
+		if (!nexthop->nh_srv6->seg6_segs ||
+		    nexthop->nh_srv6->seg6_segs->num_segs == 0 ||
+		    sid_zero(nexthop->nh_srv6->seg6_segs)) {
+			zlog_err("%s: End.M.GTP6.D{,Di} install missing SRH segs",
+				 __func__);
+			return false;
+		}
+		srh_len = fill_srh_end_b6_encaps(srh_buf, sizeof(srh_buf),
+						 nexthop->nh_srv6->seg6_segs);
+		if (srh_len < 0)
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_LOCAL_SRH, srh_buf, srh_len))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_LOCAL_MOBILE_SRC_ADDR,
+				 &ctx->mobile.src_addr, sizeof(struct in6_addr)))
+			return false;
+		if (kaction == SEG6_LOCAL_ACTION_END_M_GTP6_D &&
+		    !nl_attr_put8(nlmsg, buflen, SEG6_LOCAL_MOBILE_SR_PREFIX_LEN,
+				  ctx->mobile.sr_prefix_len))
+			return false;
+		if (ctx->ifindex &&
+		    !nl_attr_put32(nlmsg, buflen, SEG6_LOCAL_OIF, ctx->ifindex))
+			return false;
+		break;
+	}
+	case ZEBRA_SEG6_LOCAL_ACTION_H_M_GTP4_D:
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_LOCAL_ACTION, SEG6_LOCAL_ACTION_H_M_GTP4_D))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_LOCAL_NH6, &ctx->nh6, sizeof(struct in6_addr)))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_LOCAL_MOBILE_SRC_ADDR, &ctx->mobile.src_addr,
+				 sizeof(struct in6_addr)))
+			return false;
+		if (!nl_attr_put8(nlmsg, buflen, SEG6_LOCAL_MOBILE_V4_MASK_LEN,
+				  ctx->mobile.v4_mask_len))
+			return false;
+		if (!nl_attr_put8(nlmsg, buflen, SEG6_LOCAL_MOBILE_SR_PREFIX_LEN,
+				  ctx->mobile.sr_prefix_len))
+			return false;
+		break;
 	case ZEBRA_SEG6_LOCAL_ACTION_END_DX2:
 	case ZEBRA_SEG6_LOCAL_ACTION_END_B6:
 	case ZEBRA_SEG6_LOCAL_ACTION_END_BM:
@@ -2083,7 +2223,8 @@ static bool _netlink_route_build_singlepath(const struct prefix *p,
 		}
 
 		if (nexthop->nh_srv6->seg6_segs && nexthop->nh_srv6->seg6_segs->num_segs &&
-		    !sid_zero(nexthop->nh_srv6->seg6_segs)) {
+		    !sid_zero(nexthop->nh_srv6->seg6_segs) &&
+		    nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_UNSPEC) {
 			struct rtattr *nest;
 
 			if (!nl_attr_put16(nlmsg, req_size, RTA_ENCAP_TYPE,
@@ -3324,7 +3465,20 @@ ssize_t netlink_nexthop_msg_encode(uint16_t cmd,
 			if (nh->nh_srv6) {
 				if (nh->nh_srv6->seg6local_action !=
 				    ZEBRA_SEG6_LOCAL_ACTION_UNSPEC) {
-					req->nhm.nh_family = AF_INET6;
+					/*
+					 * nh_family was set above from the
+					 * route's afi (AF_INET for AFI_IP,
+					 * AF_INET6 for AFI_IP6).  Existing
+					 * End.DT4/DT6/X SIDs are installed at
+					 * IPV6_MAX_BITLEN IPv6 prefixes so afi
+					 * is already AFI_IP6 -> AF_INET6.  Only
+					 * H.M.GTP4.D is installed at an IPv4
+					 * route prefix and needs AF_INET; the
+					 * kernel registers H.M.GTP4.D with
+					 * input_family = AF_INET (see
+					 * net/ipv6/seg6_local.c) and rejects
+					 * RTM_NEWNEXTHOP with AF_INET6.
+					 */
 					encap = LWTUNNEL_ENCAP_SEG6_LOCAL;
 					if (!nl_attr_put(&req->n, buflen,
 							 NHA_ENCAP_TYPE,
