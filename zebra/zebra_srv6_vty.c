@@ -285,6 +285,18 @@ static const char *show_srv6_sid_seg6_action(enum seg6local_action_t behavior)
 		return "uDT46";
 	case ZEBRA_SEG6_LOCAL_ACTION_UNSPEC:
 		return "unspec";
+	case ZEBRA_SEG6_LOCAL_ACTION_END_MAP:
+		return "End.MAP";
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP4_E:
+		return "End.M.GTP4.E";
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_E:
+		return "End.M.GTP6.E";
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D:
+		return "End.M.GTP6.D";
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D_DI:
+		return "End.M.GTP6.D.Di";
+	case ZEBRA_SEG6_LOCAL_ACTION_H_M_GTP4_D:
+		return "H.M.GTP4.D";
 	case ZEBRA_SEG6_LOCAL_ACTION_END_T:
 	case ZEBRA_SEG6_LOCAL_ACTION_END_DX2:
 	case ZEBRA_SEG6_LOCAL_ACTION_END_B6:
@@ -333,6 +345,12 @@ static const char *show_srv6_sid_seg6_context(char *str, size_t size, const stru
 	case ZEBRA_SEG6_LOCAL_ACTION_END_AS:
 	case ZEBRA_SEG6_LOCAL_ACTION_END_AM:
 	case ZEBRA_SEG6_LOCAL_ACTION_END_BPF:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_MAP:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP4_E:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_E:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D_DI:
+	case ZEBRA_SEG6_LOCAL_ACTION_H_M_GTP4_D:
 	case ZEBRA_SEG6_LOCAL_ACTION_UNSPEC:
 		break;
 	}
