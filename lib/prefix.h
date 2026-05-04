@@ -158,10 +158,88 @@ struct evpn_addr {
 #define AF_FLOWSPEC (AF_MAX + 2)
 #endif
 
+#if !defined(AF_MUP)
+#define AF_MUP (AF_MAX + 3)
+#endif
+
 struct flowspec_prefix {
 	uint8_t family;
 	uint16_t prefixlen; /* length in bytes */
 	uintptr_t ptr;
+};
+
+/* MUP Architecture types per draft-ietf-bess-mup-safi section 3.1. */
+typedef enum {
+	BGP_MUP_ARCH_UNDEFINED = 0,
+	BGP_MUP_ARCH_3GPP_5G = 1, /* 3gpp-5g */
+} bgp_mup_architecture_type_t;
+
+/* MUP route types per draft-ietf-bess-mup-safi section 3.1. */
+typedef enum {
+	BGP_MUP_RT_RESERVED = 0,
+	BGP_MUP_ISD_ROUTE = 1,	/* Interwork Segment Discovery */
+	BGP_MUP_DSD_ROUTE = 2,	/* Direct Segment Discovery */
+	BGP_MUP_T1ST_ROUTE = 3, /* Type 1 Session Transformed (ST) */
+	BGP_MUP_T2ST_ROUTE = 4, /* Type 2 Session Transformed (ST) */
+} bgp_mup_route_type_t;
+
+/* Interwork Segment Discovery route (draft-ietf-bess-mup-safi 3.1.1). */
+struct mup_isd_route {
+	uint8_t ip_prefix_length; /* in bits, <=32 (v4) or <=128 (v6) */
+	struct ipaddr ip;	  /* prefix */
+};
+
+/* Direct Segment Discovery route (draft-ietf-bess-mup-safi 3.1.2). */
+struct mup_dsd_route {
+	struct ipaddr ip; /* originating PE address */
+};
+
+/* 3gpp-5g specific Type 1 ST extensions (draft-ietf-bess-mup-safi 3.1.3.1). */
+struct mup_t1st_3gpp_5g {
+	uint32_t teid;			 /* Tunnel Endpoint Identifier */
+	uint8_t qfi;			 /* QoS Flow Identifier */
+	uint8_t endpoint_address_length; /* 32 or 128 */
+	struct ipaddr endpoint_address;	 /* peer GTP-U endpoint */
+	uint8_t source_address_length;	 /* 0 (absent), 32, or 128 */
+	struct ipaddr source_address;	 /* valid if source_address_length > 0 */
+};
+
+/* Type 1 Session Transformed route (draft-ietf-bess-mup-safi 3.1.3). */
+struct mup_t1st_route {
+	uint8_t ip_prefix_length; /* in bits */
+	struct ipaddr ip;	  /* UE prefix */
+	struct mup_t1st_3gpp_5g t1st_3gpp_5g;
+};
+
+/* Type 2 Session Transformed route (draft-ietf-bess-mup-safi 3.1.4). */
+struct mup_t2st_route {
+	uint8_t endpoint_address_length; /* in bits, includes trailing TEID bits */
+	struct ipaddr endpoint_address;	 /* UPF N3 endpoint */
+	uint32_t teid;			 /* high-order packed in low bytes per length */
+};
+
+/* MUP NLRI common header + route-type specific data.
+ *
+ * The Route Distinguisher is encoded on the wire as the first 8 octets of
+ * every route-type-specific payload (draft-ietf-bess-mup-safi 3.1.x), so
+ * it is part of the route key and stored alongside the rest of the prefix
+ * rather than carried via a parent (RD-keyed) bgp_dest like SAFI_EVPN does.
+ */
+struct mup_prefix {
+	uint8_t arch_type;   /* bgp_mup_architecture_type_t */
+	uint16_t route_type; /* bgp_mup_route_type_t */
+	uint8_t length;	     /* route-type specific length (octets) */
+	uint8_t rd[8];	     /* Route Distinguisher (network order) */
+	union {
+		struct mup_isd_route _isd_route;
+		struct mup_dsd_route _dsd_route;
+		struct mup_t1st_route _t1st_route;
+		struct mup_t2st_route _t2st_route;
+	} u;
+#define isd_route  u._isd_route
+#define dsd_route  u._dsd_route
+#define t1st_route u._t1st_route
+#define t2st_route u._t2st_route
 };
 
 /* FRR generic prefix structure. */
@@ -182,6 +260,7 @@ struct prefix {
 		uintptr_t ptr;
 		struct evpn_addr prefix_evpn; /* AF_EVPN */
 		struct flowspec_prefix prefix_flowspec; /* AF_FLOWSPEC */
+		struct mup_prefix prefix_mup;		/* AF_MUP */
 	} u __attribute__((aligned(8)));
 };
 
@@ -279,6 +358,13 @@ struct prefix_fs {
 	struct flowspec_prefix  prefix __attribute__((aligned(8)));
 };
 
+/* MUP prefix (draft-ietf-bess-mup-safi). */
+struct prefix_mup {
+	uint8_t family;
+	uint16_t prefixlen;
+	struct mup_prefix prefix __attribute__((aligned(8)));
+};
+
 struct prefix_sg {
 	uint8_t family;
 	uint16_t prefixlen;
@@ -294,6 +380,7 @@ union prefixptr {
 	uniontype(prefixptr, struct prefix_evpn, evp)
 	uniontype(prefixptr, struct prefix_fs,   fs)
 	uniontype(prefixptr, struct prefix_rd,   rd)
+	uniontype(prefixptr, struct prefix_mup,  mup)
 } TRANSPARENT_UNION;
 
 union prefixconstptr {
@@ -303,6 +390,7 @@ union prefixconstptr {
 	uniontype(prefixconstptr, const struct prefix_evpn, evp)
 	uniontype(prefixconstptr, const struct prefix_fs,   fs)
 	uniontype(prefixconstptr, const struct prefix_rd,   rd)
+	uniontype(prefixconstptr, const struct prefix_mup,  mup)
 } TRANSPARENT_UNION;
 /* clang-format on */
 
