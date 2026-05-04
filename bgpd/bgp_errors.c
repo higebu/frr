@@ -576,6 +576,21 @@ static struct log_ref ferr_bgp_err[] = {
 		.suggestion = "Check that BGP-LS peer is sending valid packets per RFC 9552. May indicate interoperability issue or malformed data.",
 	},
 	{
+		.code = EC_BGP_MUP_FAIL,
+		.title = "BGP-MUP processing failure",
+		.description = "BGP-MUP route advertise/withdraw could not be processed.",
+		.suggestion =
+			"Check the local and peer configuration of BGP-MUP and inspect the BGP UPDATE message contents for malformed fields per draft-ietf-bess-mup-safi.",
+	},
+	{
+		.code = EC_BGP_MUP_ROUTE_INVALID,
+		.title = "Malformed BGP-MUP NLRI",
+		.description =
+			"Received BGP-MUP NLRI does not conform to draft-ietf-bess-mup-safi (length, prefix, TEID, endpoint, or source address invalid).",
+		.suggestion =
+			"The route is treated as withdraw per RFC 7606. Verify peer encoding and architecture/route type combinations.",
+	},
+	{
 		.code = END_FERR,
 	}
 };
