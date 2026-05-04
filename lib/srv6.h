@@ -57,23 +57,51 @@ enum seg6_mode_t {
 };
 
 enum seg6local_action_t {
-	ZEBRA_SEG6_LOCAL_ACTION_UNSPEC       = 0,
-	ZEBRA_SEG6_LOCAL_ACTION_END          = 1,
-	ZEBRA_SEG6_LOCAL_ACTION_END_X        = 2,
-	ZEBRA_SEG6_LOCAL_ACTION_END_T        = 3,
-	ZEBRA_SEG6_LOCAL_ACTION_END_DX2      = 4,
-	ZEBRA_SEG6_LOCAL_ACTION_END_DX6      = 5,
-	ZEBRA_SEG6_LOCAL_ACTION_END_DX4      = 6,
-	ZEBRA_SEG6_LOCAL_ACTION_END_DT6      = 7,
-	ZEBRA_SEG6_LOCAL_ACTION_END_DT4      = 8,
-	ZEBRA_SEG6_LOCAL_ACTION_END_B6       = 9,
+	ZEBRA_SEG6_LOCAL_ACTION_UNSPEC = 0,
+	ZEBRA_SEG6_LOCAL_ACTION_END = 1,
+	ZEBRA_SEG6_LOCAL_ACTION_END_X = 2,
+	ZEBRA_SEG6_LOCAL_ACTION_END_T = 3,
+	ZEBRA_SEG6_LOCAL_ACTION_END_DX2 = 4,
+	ZEBRA_SEG6_LOCAL_ACTION_END_DX6 = 5,
+	ZEBRA_SEG6_LOCAL_ACTION_END_DX4 = 6,
+	ZEBRA_SEG6_LOCAL_ACTION_END_DT6 = 7,
+	ZEBRA_SEG6_LOCAL_ACTION_END_DT4 = 8,
+	ZEBRA_SEG6_LOCAL_ACTION_END_B6 = 9,
 	ZEBRA_SEG6_LOCAL_ACTION_END_B6_ENCAP = 10,
-	ZEBRA_SEG6_LOCAL_ACTION_END_BM       = 11,
-	ZEBRA_SEG6_LOCAL_ACTION_END_S        = 12,
-	ZEBRA_SEG6_LOCAL_ACTION_END_AS       = 13,
-	ZEBRA_SEG6_LOCAL_ACTION_END_AM       = 14,
-	ZEBRA_SEG6_LOCAL_ACTION_END_BPF      = 15,
-	ZEBRA_SEG6_LOCAL_ACTION_END_DT46     = 16,
+	ZEBRA_SEG6_LOCAL_ACTION_END_BM = 11,
+	ZEBRA_SEG6_LOCAL_ACTION_END_S = 12,
+	ZEBRA_SEG6_LOCAL_ACTION_END_AS = 13,
+	ZEBRA_SEG6_LOCAL_ACTION_END_AM = 14,
+	ZEBRA_SEG6_LOCAL_ACTION_END_BPF = 15,
+	ZEBRA_SEG6_LOCAL_ACTION_END_DT46 = 16,
+	/* SRv6 Mobile User Plane behaviours (RFC 9433 / kernel UAPI on
+	 * higebu/linux:b4/seg6-mobile - SEG6_LOCAL_ACTION_* values 17..22).
+	 */
+	ZEBRA_SEG6_LOCAL_ACTION_END_MAP = 17,
+	ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP4_E = 18,
+	ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_E = 19,
+	ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D = 20,
+	ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D_DI = 21,
+	ZEBRA_SEG6_LOCAL_ACTION_H_M_GTP4_D = 22,
+};
+
+/* Mobile User Plane (RFC 9433) inputs carried alongside seg6local actions.
+ * Values mirror SEG6_LOCAL_MOBILE_* netlink attribute IDs 13..17 added on
+ * higebu/linux:b4/seg6-mobile.
+ */
+struct seg6local_mobile_info {
+	/* PSA / encap source IPv6 address. */
+	struct in6_addr src_addr;
+	/* IPv4 mask length used by H.M.GTP4.D / End.M.GTP4.E (0..32). */
+	uint8_t v4_mask_len;
+	/* PDU direction: 0 = downlink, 1 = uplink. */
+	uint8_t pdu_type;
+	/* IPv6 source-prefix length (optional, 0 if unused). */
+	uint8_t v6_src_prefix_len;
+	/* SR service prefix length used by End.M.GTP6.D / H.M.GTP4.D. */
+	uint8_t sr_prefix_len;
+	/* True when at least one of the fields above is meaningful. */
+	bool valid;
 };
 
 /* Flavor operations for SRv6 End* Behaviors */
@@ -126,6 +154,8 @@ struct seg6local_context {
 	uint8_t node_len;
 	uint8_t function_len;
 	uint8_t argument_len;
+	/* Optional Mobile User Plane parameters (End.M.* / H.M.GTP4.D). */
+	struct seg6local_mobile_info mobile;
 };
 
 struct srv6_locator {
@@ -504,6 +534,18 @@ static inline const char *srv6_sid_ctx2str(char *str, size_t size,
 	case ZEBRA_SEG6_LOCAL_ACTION_END_DT46:
 		snprintf(str + len, size - len, " vrf_id %u (%s)", ctx->vrf_id,
 			 vrf_id_to_name(ctx->vrf_id));
+		break;
+
+	case ZEBRA_SEG6_LOCAL_ACTION_END_MAP:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP4_E:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_E:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D:
+	case ZEBRA_SEG6_LOCAL_ACTION_END_M_GTP6_D_DI:
+	case ZEBRA_SEG6_LOCAL_ACTION_H_M_GTP4_D:
+		/* MUP/mobile-uplane actions; per-action attrs live in
+		 * seg6local_context.mobile (see _netlink_nexthop_encode_
+		 * seg6local_info()) and are not in struct srv6_sid_ctx.
+		 */
 		break;
 
 	case ZEBRA_SEG6_LOCAL_ACTION_END_DX2:
