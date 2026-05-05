@@ -3642,7 +3642,7 @@ int srv6_manager_get_sid(struct zclient *zclient, const struct srv6_sid_ctx *ctx
 	stream_put(s, ctx, sizeof(struct srv6_sid_ctx));
 
 	/* Flags */
-	if (!sid_zero_ipv6(sid_value))
+	if (sid_value && !sid_zero_ipv6(sid_value))
 		SET_FLAG(flags, ZAPI_SRV6_MANAGER_SID_FLAG_HAS_SID_VALUE);
 	if (locator_name)
 		SET_FLAG(flags, ZAPI_SRV6_MANAGER_SID_FLAG_HAS_LOCATOR);
