@@ -4386,6 +4386,273 @@ This makes it possible to separate not only layer 3 networks like VRF-lite netwo
 Also, VRF netns based make possible to separate layer 2 networks on separate VRF
 instances.
 
+.. _bgp-mup:
+
+BGP Mobile User Plane (MUP) SAFI
+--------------------------------
+
+FRR implements the BGP Mobile User Plane SAFI defined in
+`draft-ietf-bess-mup-safi
+<https://datatracker.ietf.org/doc/draft-ietf-bess-mup-safi/>`_.  The
+SAFI carries four route types used by an SRv6 Mobile User Plane
+(SRv6-MUP) deployment between Provider Edges and a MUP Controller:
+
+  - Type 1 - Interwork Segment Discovery (ISD)
+  - Type 2 - Direct Segment Discovery (DSD)
+  - Type 3 - Type 1 Session Transformed (T1ST)
+  - Type 4 - Type 2 Session Transformed (T2ST)
+
+Together with the SRv6 mobile-uplane behaviours defined in RFC 9433
+(End.M.GTP4.E, End.M.GTP6.D, End.M.GTP6.D.Di, End.M.GTP6.E,
+H.M.GTP4.D, End.MAP), the BGP-MUP SAFI lets BGP advertise the
+session state required to bridge GTP-U and SRv6 forwarding planes.
+
+Enabling BGP-MUP on a peering
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The IPv4 and IPv6 sub-AFIs are activated independently:
+
+.. code-block:: frr
+
+   router bgp 65000
+    neighbor 2001:db8::1 remote-as 65000
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8::1 activate
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8::1 activate
+    exit-address-family
+
+Activating these address families causes the local speaker to
+advertise the BGP MP capability for ``AFI=IPv4|IPv6, SAFI=85`` and
+parse all four route types per draft-ietf-bess-mup-safi.
+
+Originating ISD / DSD as a MUP-PE / MUP-GW
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When FRR plays the MUP-PE / MUP-GW role, every VRF-local MUP knob
+lives under ``address-family ipv4|ipv6 mup`` of a non-default-vrf
+bgp instance (RFC 8986 Section 4.7-Section 4.8: ``End.DT4`` /
+``End.DT6`` are vrf-mandatory).  BGP-MUP and the unicast SAFI are
+independent: nothing on the unicast side originates MUP NLRIs, and
+the unicast block has no implicit cross-SAFI hooks.
+
+* **ISD** is driven from the per-(vrf, afi, SAFI_MUP) RIB
+  locally-originated set.  Configure ``rd`` /
+  ``rt export`` (or ``rt both``) / ``sid`` /
+  ``segment interwork`` under the MUP AF, and inject prefixes via
+  ``network`` and/or ``redistribute <protocol>`` (also under MUP AF).
+  Every locally-originated entry in that table — ``BGP_ROUTE_STATIC``
+  from ``network`` and ``BGP_ROUTE_REDISTRIBUTE`` from
+  ``redistribute`` — becomes one ISD NLRI.
+
+  ISD prefixes carry **N3 (gNB-side) reachability** per
+  draft-ietf-bess-mup-safi Section 3.3.1 ("route per each N3RAN IP
+  prefix"), not UE prefixes.  UE prefixes are matched at the receiver
+  via T1ST resolution (Section 3.3.9) but they are not advertised by
+  ISD.
+
+* **DSD** is a single per-(vrf, afi) NLRI emitted from the
+  ``segment direct`` sub-block.  Inside the sub-block, the operator
+  configures the originating-speaker ``address`` (optional; defaults
+  to the bgp router-id), the End.DT* ``behavior`` (required), and
+  the ``segment-id`` (BGP MUP Extended Community,
+  Direct-Type Segment Identifier sub-type, draft Section 3.2;
+  required).  RD / RT / SID come from
+  the shared knobs on the same (vrf, afi) policy.
+
+``segment interwork`` and ``segment direct`` are mutually exclusive
+on a given (vrf, AFI): a single policy emits at most one of ISD or
+DSD.  Auto-activation is predicate-only — origination starts the
+moment ``rd`` is set together with a segment selector; install of
+received MUP NLRIs starts the moment ``rt import`` (or ``rt both``)
+is set.  There is no master ``[no] export mup`` / ``[no] import
+mup`` toggle.
+
+A configured SRv6 locator must be referenced under
+``router bgp / segment-routing srv6 / locator <name>`` first; bgpd
+then asks zebra's SRv6 SID manager to allocate functions under that
+locator (one per ``(vrf, AFI)`` for ISD; one per ``(vrf, AFI)`` for
+DSD).
+
+.. clicmd:: rd AS:NN|IP:nn
+
+   Route distinguisher attached to locally-originated ISD/DSD NLRIs.
+   Only valid under ``address-family ipv4|ipv6 mup`` of a
+   non-default-vrf bgp instance.
+
+.. clicmd:: rt <import|export|both> RTLIST...
+
+   Space-separated route-target list applied to MUP NLRIs.
+   ``import`` matches any RT in incoming MUP NLRIs (gates which
+   T1ST/T2ST install in this vrf); ``export`` is set on every
+   locally-originated ISD/DSD; ``both`` is shorthand for the same
+   RTLIST in both directions.
+
+.. clicmd:: route-map <import|export> RMAP
+
+   Route-map applied to received MUP NLRIs (``import``, gates
+   per-VRF install) or locally-originated NLRIs (``export``,
+   filters which entries from the SAFI_MUP RIB locally-originated
+   set become ISDs).
+
+.. clicmd:: sid <auto|explicit X:X::X:X> [locator NAME]
+
+   SRv6 prefix-SID attached to locally-originated ISD/DSD.  Per
+   draft Section 3.3.1 the ISD behavior is ``End.M.GTP4.E`` for the
+   IPv4 sub-AFI and ``End.M.GTP6.E`` for the IPv6 sub-AFI; bgpd
+   selects it automatically.  ``auto`` requests a per-(vrf, AFI)
+   function from zebra's SRv6 SID manager.  ``explicit`` is an
+   escape hatch for inter-AS or migration scenarios that need a
+   pinned SID value.
+
+   The optional ``locator NAME`` token overrides the bgp instance's
+   ``segment-routing srv6 locator`` default for this single
+   ``(vrf, AFI)`` policy — partitioning the locator block per
+   behaviour or per slice is operationally meaningful because the
+   SID's function carries the End.M.GTP*.E selector.
+
+.. clicmd:: nexthop [A.B.C.D|X:X::X:X]
+
+   Override the next-hop carried in locally-originated MUP NLRIs.
+   Applies to both ISD and DSD on this (vrf, AFI).  IPv4 input is
+   stored as IPv4-mapped IPv6 since MUP NLRIs always carry an IPv6
+   next-hop on the wire.
+
+.. clicmd:: segment interwork
+
+   Enable ISD origination on this (vrf, AFI).  Single-line; mutually
+   exclusive with ``segment direct``.  ISDs are emitted per
+   locally-originated entry in the (vrf, AFI, SAFI_MUP) RIB.
+
+.. clicmd:: segment direct
+
+   Enter the DSD sub-block (``BGP_IPV[46]_MUP_SEGMENT_DIRECT_NODE``).
+   Mutually exclusive with ``segment interwork``.  Inside the
+   sub-block:
+
+   .. clicmd:: address A.B.C.D
+
+      DSD originating-speaker Address (default = bgp router-id).
+
+   .. clicmd:: behavior <dt4|dt6|dt46>
+
+      End.DT* function for the DSD prefix-SID.  Per
+      draft Section 3.3.4 the function reflects the inner PDU lookup
+      AFI (PDU session type), independent of the DSD's Address AFI.
+      Required for DSD activation.
+
+   .. clicmd:: segment-id ASN:NN
+
+      BGP MUP Extended Community, Direct-Type Segment Identifier
+      sub-type (draft Section 3.2) carried on every DSD originated
+      from this (vrf, AFI).  Required for DSD activation.
+
+Example:
+
+.. code-block:: frr
+
+   segment-routing
+    srv6
+     locators
+      locator default
+       prefix 2001:db8:e::/48 block-len 24 node-len 24 func-bits 8
+   !
+   router bgp 65001
+    bgp router-id 1.1.1.1
+    neighbor 2001:db8::2 remote-as 65002
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8::2 activate
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8::2 activate
+    exit-address-family
+   exit
+   !
+   ! ISD origination on slice1 (interwork) — emits one ISD per
+   ! locally-originated entry in (slice1, AFI_*, SAFI_MUP) RIB.
+   router bgp 65001 vrf slice1
+    bgp router-id 1.1.1.1
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     redistribute connected
+     rd 100:100
+     rt export 65001:1
+     sid auto
+     segment interwork
+    exit-address-family
+    !
+    address-family ipv6 mup
+     redistribute connected
+     rd 200:200
+     rt export 65001:2
+     sid auto
+     segment interwork
+    exit-address-family
+   exit
+   !
+   ! DSD origination on slice2 (direct) — single DSD per (vrf, afi).
+   router bgp 65001 vrf slice2
+    bgp router-id 1.1.1.1
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     rd 300:300
+     rt export 65001:1
+     sid auto
+     segment direct
+      address 10.0.0.250
+      behavior dt4
+      segment-id 65001:10
+     exit
+    exit-address-family
+   exit
+
+Note that **ISD and DSD origination is control-plane only**.  No
+seg6local forwarding state is installed on the originating MUP-GW as a
+side effect — the SID advertised in ISD/DSD is the locator + function
+base, and per-session forwarding state lands on the receiver-side MUP
+nodes when an external MUP-Controller distributes Type 1 / Type 2
+Session Transformed (T1ST/T2ST) routes that point under that base.
+T1ST / T2ST origination is therefore intentionally not exposed by
+FRR; it is the MUP-Controller's responsibility.
+
+Importing received MUP routes into a vrf
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A non-default-vrf bgp instance imports received MUP routes whose
+Route-Target extended community matches one of its configured
+``rt import`` (or ``rt both``) RTs.  A vrf with no ``rt import``
+line imports nothing.
+
+A typical pure receive-only PE looks like::
+
+   router bgp 65002 vrf slice1
+    address-family ipv4 mup
+     rt import 65001:1
+    exit-address-family
+   exit
+
+The ``rt import`` line is mandatory for receive: a vrf without it
+never imports received MUP routes.  Origination-side ``rt export``
+lines do **not** double as an implicit import — export and import
+RTs are independent.
+
 .. _bgp-conditional-advertisement:
 
 BGP Conditional Advertisement
