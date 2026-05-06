@@ -48,6 +48,7 @@
 #include "bgpd/bgp_errors.h"
 #include "bgpd/bgp_script.h"
 #include "bgpd/bgp_evpn_mh.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_nhg.h"
 #include "bgpd/bgp_routemap_nb.h"
 #include "bgpd/bgp_community_alias.h"
@@ -210,6 +211,7 @@ static FRR_NORETURN void bgp_exit(int status)
 		bgp_delete(bgp_default);
 
 	bgp_evpn_mh_finish();
+	bgp_mup_finish();
 	bgp_nhg_finish();
 
 	zebra_announce_fini(&bm->zebra_announce_head);
