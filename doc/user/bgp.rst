@@ -4386,6 +4386,210 @@ This makes it possible to separate not only layer 3 networks like VRF-lite netwo
 Also, VRF netns based make possible to separate layer 2 networks on separate VRF
 instances.
 
+.. _bgp-mup:
+
+BGP Mobile User Plane (MUP) SAFI
+--------------------------------
+
+FRR implements the BGP Mobile User Plane SAFI defined in
+`draft-ietf-bess-mup-safi
+<https://datatracker.ietf.org/doc/draft-ietf-bess-mup-safi/>`_.  The
+SAFI carries four route types used by an SRv6 Mobile User Plane
+(SRv6-MUP) deployment between Provider Edges and a MUP Controller:
+
+  - Type 1 - Interwork Segment Discovery (ISD)
+  - Type 2 - Direct Segment Discovery (DSD)
+  - Type 3 - Type 1 Session Transformed (T1ST)
+  - Type 4 - Type 2 Session Transformed (T2ST)
+
+Together with the SRv6 mobile-uplane behaviours defined in RFC 9433
+(End.M.GTP4.E, End.M.GTP6.D, End.M.GTP6.D.Di, End.M.GTP6.E,
+H.M.GTP4.D, End.MAP), the BGP-MUP SAFI lets BGP advertise the
+session state required to bridge GTP-U and SRv6 forwarding planes.
+
+Enabling BGP-MUP on a peering
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The IPv4 and IPv6 sub-AFIs are activated independently:
+
+.. code-block:: frr
+
+   router bgp 65000
+    neighbor 2001:db8::1 remote-as 65000
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8::1 activate
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8::1 activate
+    exit-address-family
+
+Activating these address families causes the local speaker to
+advertise the BGP MP capability for ``AFI=IPv4|IPv6, SAFI=85`` and
+parse all four route types per draft-ietf-bess-mup-safi.
+
+Originating ISD / DSD as a MUP-PE / MUP-GW
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When FRR plays the MUP-PE / MUP-GW role, ISD and DSD origination use
+two distinct configuration surfaces, both bound to a non-default-vrf
+bgp instance (RFC 8986 §4.7-§4.8: ``End.DT4``/``End.DT6`` are
+vrf-mandatory):
+
+* **ISD** is driven from the per-vrf unicast RIB.  Configure
+  ``rd mup export`` / ``rt mup export`` (and optionally
+  ``sid mup export``) under
+  ``address-family ipv4 unicast`` /
+  ``address-family ipv6 unicast`` of the per-vrf bgp instance.  Every
+  selected best-path in that unicast RIB — populated via ``network``,
+  ``redistribute connected``, ``redistribute static``, peer-learned
+  routes, aggregates — is then leaked into the BGP-MUP SAFI as an ISD
+  NLRI.  This mirrors L3VPN's
+  ``rd vpn export`` / ``rt vpn export`` / ``sid vpn export`` model.
+
+  ISD prefixes carry **N3 (gNB-side) reachability** per
+  draft-ietf-bess-mup-safi §3.3.1 ("route per each N3RAN IP prefix"),
+  not UE prefixes.  UE prefixes are matched at the receiver via T1ST
+  resolution (§3.3.9) but they are not advertised by ISD.
+
+* **DSD** is configured per-host with the ``segment direct`` command
+  under ``address-family ipv4|ipv6 mup``.  ``segment direct`` is
+  unchanged from earlier releases.
+
+A configured SRv6 locator must be referenced under
+``router bgp / segment-routing srv6 / locator <name>`` first; bgpd
+then asks zebra's SRv6 SID manager to allocate functions under that
+locator (one per ``(vrf, AFI)`` for ISD; one per host for DSD).
+
+.. clicmd:: rd mup export AS:NN|IP:nn
+
+   Specify the route distinguisher to be attached to ISD NLRIs leaked
+   from the current unicast vrf to the BGP-MUP SAFI.  Only valid under
+   ``address-family ipv4 unicast`` / ``address-family ipv6 unicast``
+   of a non-default-vrf bgp instance.  Sibling of ``rd vpn export``.
+
+.. clicmd:: rt mup export RTLIST...
+
+   Specify the space-separated route-target list to be attached to
+   ISD NLRIs leaked from the current unicast vrf to BGP-MUP.  Only
+   valid under unicast AF of a non-default-vrf bgp instance.
+   Sibling of ``rt vpn export``.
+
+.. clicmd:: sid mup export <auto|explicit X:X::X:X>
+
+   Allocate the SRv6 prefix-SID attached to ISD NLRIs leaked from the
+   current ``(vrf, AFI)``.  Per draft-ietf-bess-mup-safi §3.3.1 the
+   behaviour MUST be ``End.M.GTP4.E`` for the IPv4 sub-AFI and
+   ``End.M.GTP6.E`` for the IPv6 sub-AFI; the behaviour is selected
+   automatically.  ``auto`` requests a per-``(vrf, AFI)`` function
+   from zebra's SRv6 SID manager (one SID covers every ISD NLRI from
+   the same vrf/AFI — receivers disambiguate per-session flows via
+   the T1ST NLRI, not via the ISD SID).  ``explicit`` is an escape
+   hatch for inter-AS or migration scenarios that need a pinned SID
+   value.  Sibling of ``sid vpn export``.
+
+.. clicmd:: [no] segment direct <A.B.C.D|X:X::X:X> rd <RD> rt <RT> mup <ASN:NN> behavior <dt4|dt6|dt46> [sid explicit X:X::X:X]
+
+   Originate a Direct Segment Discovery (DSD) route.  ``<ADDR>`` is
+   the DSD NLRI's *Address* field per draft-ietf-bess-mup-safi
+   §3.1.2 — the address of the originating BGP speaker; in the 3GPP
+   5G architecture this is typically the UPF host's IP.
+
+   ``behavior`` selects the prefix-SID's End.DT* function and is
+   mandatory: per draft §3.3.4 the function MAY be ``End.DT4`` /
+   ``End.DT6`` / ``End.DT46``, with the choice driven by the inner
+   PDU lookup AFI (PDU session type), which is independent of the
+   DSD Address AFI.  The operator must therefore declare it
+   explicitly — there is no AFI-derived default.
+
+   The ``mup`` keyword carries the MUP Extended Community.
+
+Example:
+
+.. code-block:: frr
+
+   segment-routing
+    srv6
+     locators
+      locator default
+       prefix 2001:db8:e::/48 block-len 24 node-len 24 func-bits 8
+   !
+   router bgp 65001
+    neighbor 2001:db8::2 remote-as 65002
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8::2 activate
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8::2 activate
+    exit-address-family
+   exit
+   !
+   router bgp 65001 vrf slice1
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 unicast
+     redistribute connected
+     rd mup export 100:100
+     rt mup export 65001:1
+     sid mup export auto
+    exit-address-family
+    !
+    address-family ipv4 mup
+     segment direct 10.0.0.250 rd 100:100 rt 65001:1 mup 65001:10 behavior dt4
+    exit-address-family
+    !
+    address-family ipv6 unicast
+     redistribute connected
+     rd mup export 200:200
+     rt mup export 65001:2
+     sid mup export auto
+    exit-address-family
+   exit
+
+Note that **ISD and DSD origination is control-plane only**.  No
+seg6local forwarding state is installed on the originating MUP-GW as a
+side effect — the SID advertised in ISD/DSD is the locator + function
+base, and per-session forwarding state lands on the receiver-side MUP
+nodes when an external MUP-Controller distributes Type 1 / Type 2
+Session Transformed (T1ST/T2ST) routes that point under that base.
+T1ST / T2ST origination is therefore intentionally not exposed by
+FRR; it is the MUP-Controller's responsibility.
+
+Importing received MUP routes into a vrf
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A non-default-vrf bgp instance imports received MUP routes whose
+Route-Target extended community matches one of its configured
+``route-target import`` lines.  This mirrors L3VPN's
+``route-target vpn import`` and the receive side of
+``vpn_leak_to_vrf_update_onevrf``: a vrf with no ``route-target
+import`` line imports nothing, regardless of the RTs it exports via
+``segment ... rt RT``.
+
+.. clicmd:: [no] route-target import RTLIST
+
+   Configure the per-vrf RT import filter under ``address-family ipv4
+   mup`` / ``address-family ipv6 mup`` of a non-default-vrf bgp
+   instance.  ``RTLIST`` is a space-separated list of RT extended
+   communities (``ASN:NN`` or ``A.B.C.D:NN``).  An incoming MUP route
+   is imported into this vrf iff its RT matches at least one RT in
+   the list.
+
+   This command is mandatory for receive: a vrf without it never
+   imports received MUP routes.  Origination-side ``segment ... rt
+   RT`` lines do **not** double as an implicit import — export and
+   import RTs are independent, exactly as in L3VPN.
+
 .. _bgp-conditional-advertisement:
 
 BGP Conditional Advertisement
