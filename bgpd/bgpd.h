@@ -20,6 +20,12 @@
 
 PREDECL_LIST(zebra_announce);
 PREDECL_LIST(zebra_l2_vni);
+PREDECL_HASH(bgp_mup_isd_hash);
+PREDECL_HASH(bgp_mup_dsd_hash);
+PREDECL_HASH(bgp_mup_dsd_segid_hash);
+struct bgp_mup_export_policy;
+
+struct route_table;
 
 enum bgp_bp_install_type {
 	BGP_BP_INSTALL_ROUTE,
@@ -809,6 +815,12 @@ struct bgp {
 #define BGP_CONFIG_VRF_TO_VRF_EXPORT (1 << 10)
 /* vpnvx retain flag */
 #define BGP_VPNVX_RETAIN_ROUTE_TARGET_ALL (1 << 11)
+/* import side of the unicast<->BGP-MUP leak.  EXPLICIT latches once the
+ * operator types `[no] import mup` so subsequent rt mup import edits
+ * don't re-trigger auto-set.
+ */
+#define BGP_CONFIG_MUP_TO_VRF_IMPORT (1 << 12)
+#define BGP_CONFIG_MUP_TO_VRF_IMPORT_EXPLICIT (1 << 13)
 
 	/* BGP per AF peer count */
 	uint32_t af_peer_count[AFI_MAX][SAFI_MAX];
@@ -1084,6 +1096,40 @@ struct bgp {
 
 	/* BGP L3 service IPv4/v6 SRv6 backend */
 	struct srv6_policy srv6_unicast[AFI_MAX];
+
+	/* BGP-MUP discovery cache: received ISD/DSD routes used to resolve
+	 * incoming T1ST/T2ST routes (draft-ietf-bess-mup-safi Section 3.3.9 /
+	 * Section 3.3.12).  Opaque from bgpd.h's perspective; structures live in
+	 * bgp_mup.c.
+	 *
+	 * ISD: exact-match hash on (afi, prd, prefix) + per-AFI route_table for
+	 * LPM lookup of an ISD covering a T1ST endpoint.
+	 * DSD: exact-match hash on (afi, prd, endpoint) + segment_id hash for
+	 * T2ST resolution.
+	 */
+	struct bgp_mup_isd_hash_head *mup_isd_hash;
+	struct route_table *mup_isd_lpm[AFI_MAX];
+	struct bgp_mup_dsd_hash_head *mup_dsd_hash;
+	struct bgp_mup_dsd_segid_hash_head *mup_dsd_segid_hash;
+
+	/* BGP-MUP discovery cache: pending coalesced reannounce of T1ST/T2ST
+	 * paths after ISD/DSD cache mutation.  One slot per AFI; a flood of
+	 * cache mutations within a single UPDATE collapses to one RIB walk.
+	 */
+	struct event *mup_reannounce_ev[AFI_MAX];
+
+	/* BGP-MUP per-vrf-per-afi policy.  Mirrors L3VPN's
+	 * vpn_policy[afi]: RT list (both directions) configured under
+	 * `address-family ipv[46] unicast` via
+	 * `rt mup <import|export|both>`.  The FROMMUP slot gates which
+	 * T1ST/T2ST received in the default-vrf MUP RIB the vrf installs
+	 * (mirrors vpn_policy[afi].rtlist[FROMVPN]); the TOMUP slot is
+	 * reserved for the originate path landed in a later commit.
+	 * Opaque pointer to keep MUP-internal types out of bgpd.h;
+	 * lazily allocated by bgp_mup.c on first CLI mutation, freed by
+	 * bgp_mup_export_clear() on instance teardown.
+	 */
+	struct bgp_mup_export_policy *mup_export[AFI_MAX];
 
 	/* TCP keepalive parameters for BGP connection */
 	uint16_t tcp_keepalive_idle;
