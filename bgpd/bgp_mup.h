@@ -33,6 +33,83 @@ int bgp_nlri_parse_mup(struct peer *peer, struct attr *attr, struct bgp_nlri *pa
 int bgp_mup_zebra_announce(struct bgp_dest *dest, struct bgp_path_info *info, struct bgp *bgp);
 int bgp_mup_zebra_withdraw(struct bgp_dest *dest, struct bgp_path_info *info, struct bgp *bgp);
 
+/* Locally originate ISD/DSD routes (FRR as MUP-PE/MUP-GW per
+ * draft-ietf-bess-mup-safi).  T1ST/T2ST origination is intentionally
+ * not provided: those routes carry per-session 5G state and are the
+ * responsibility of an external MUP Controller (MUP-C).
+ *
+ * The advertised SID consists of the BGP instance's configured SRv6
+ * locator + a function (RFC 8986 SID Structure).  Function allocation:
+ *
+ *   - Auto (default): bgpd asks zebra's SRv6 SID manager for a function
+ *     under the configured locator (mirrors `sid vpn export auto`).
+ *     zebra installs the local seg6local kernel state as a side-effect
+ *     of allocation.
+ *   - Explicit (`sid explicit X:X::X:X`): operator pins a specific SID
+ *     (escape hatch for inter-AS / migration scenarios).
+ *
+ * Behavior:
+ *   - ISD: MUST be End.M.GTP4.E (IPv4 AFI) / End.M.GTP6.E (IPv6 AFI)
+ *     per draft Section 3.3.1; chosen automatically by AFI.
+ *   - DSD: End.DT4 / End.DT6; operator picks via `behavior` keyword.
+ */
+struct ecommunity;
+struct ipaddr;
+
+/* Operator-facing parameters captured from VTY; shared between the two
+ * route types so we keep the caller signature small.  See bgp_mup.c
+ * for the synchronous (sid explicit) and async (auto-allocate) paths.
+ */
+struct bgp_mup_origin_args {
+	afi_t afi;
+	struct prefix_rd prd;
+	struct ecommunity *ecom; /* RT (+ MUP for DSD); caller owns */
+	bool has_explicit_sid;
+	struct in6_addr explicit_sid; /* used iff has_explicit_sid */
+	/* Per-route-type extras */
+	struct prefix isd_prefix;   /* ISD only */
+	struct ipaddr dsd_endpoint; /* DSD only */
+	uint16_t dsd_behavior;	    /* DSD only: End.DT4 / End.DT6 */
+};
+
+int bgp_mup_originate_isd(struct bgp *bgp, const struct bgp_mup_origin_args *args, bool withdraw);
+int bgp_mup_originate_dsd(struct bgp *bgp, const struct bgp_mup_origin_args *args, bool withdraw);
+void bgp_mup_vty_init(void);
+
+/* Process-wide self-origin index init/finish.  Mirrors bgp_mac_init /
+ * bgp_mac_finish: bm-scoped hashes that let receive-side T1ST/T2ST
+ * resolution detect self-originated ISD/DSD in O(1).
+ */
+void bgp_mup_master_init(void);
+void bgp_mup_master_finish(void);
+
+/* Locator-arrival replay: called after zebra ships SRv6 locator chunks
+ * to bgpd, so any `segment` lines that landed before chunks were
+ * available finish their SID setup.  Same role as L3VPN's
+ * vpn_leak_postchange_all().
+ */
+void bgp_mup_replay_origins_all(void);
+
+/* Locator-delete hook: symmetric counterpart of
+ * bgp_mup_replay_origins_all().  Called from bgp_zebra.c's
+ * bgp_zebra_process_srv6_locator_delete_per_bgp() after the L3VPN
+ * cleanup so MUP drops any persisted origin's install fingerprint
+ * and OIF cache that resolved against the just-deleted locator,
+ * and schedules a coalesced T1ST/T2ST reannounce on the affected
+ * (bgp, afi).
+ */
+struct srv6_locator;
+void bgp_mup_process_srv6_locator_delete_per_bgp(struct srv6_locator *loc, struct bgp *bgp);
+
+/* Emit the persisted `segment` lines for `address-family ipv4|ipv6 mup`. */
+void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi);
+
+/* Free the per-bgp persistent origin list (called from bgp_free). */
+void bgp_mup_origin_list_free(struct bgp *bgp);
+
+/* Drain the per-bgp pending-originate list (called from bgp_free). */
+void bgp_mup_pending_list_free(struct bgp *bgp);
+
 /* Free the per-bgp ISD/DSD discovery caches (called from bgp_free). */
 void bgp_mup_caches_free(struct bgp *bgp);
 
@@ -41,5 +118,14 @@ void bgp_mup_caches_free(struct bgp *bgp);
  * on every connected-address add/delete in @vrf_id.
  */
 void bgp_mup_iface_addr_change(vrf_id_t vrf_id);
+
+/* SRv6 SID manager async completion: zebra returned a SID for one of
+ * our pending originate requests.  Called from bgp_zebra.c's
+ * ZAPI_SRV6_SID_ALLOCATED handler when the ctx's behavior is one of
+ * the MUP behaviors (End.M.GTP*.E for ISD, End.DT/DX for DSD).
+ */
+struct srv6_sid_ctx;
+bool bgp_mup_handle_sid_alloc(struct bgp *bgp, const struct srv6_sid_ctx *ctx,
+			      const struct in6_addr *sid_value);
 
 #endif /* _FRR_BGP_MUP_H */
