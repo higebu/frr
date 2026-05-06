@@ -4748,6 +4748,8 @@ void bgp_free(struct bgp *bgp)
 	bgp_scan_finish(bgp);
 	bgp_address_destroy(bgp);
 	bgp_tip_hash_destroy(bgp);
+	bgp_mup_origin_list_free(bgp);
+	bgp_mup_pending_list_free(bgp);
 	bgp_mup_caches_free(bgp);
 
 	/* release the auto RD id */
@@ -9136,6 +9138,7 @@ void bgp_master_init(struct event_loop *master, const int buffer_size,
 	bm->peer_clearing_batch_max_dests = BGP_CLEARING_BATCH_MAX_DESTS;
 
 	bgp_mac_init();
+	bgp_mup_master_init();
 	/* init the rd id space.
 	   assign 0th index in the bitfield,
 	   so that we start with id 1
@@ -9367,6 +9370,7 @@ void bgp_init(unsigned short instance)
 
 	/* BGP VTY commands installation.  */
 	bgp_vty_init();
+	bgp_mup_vty_init();
 
 	/* BGP inits. */
 	bgp_attr_init();
@@ -9455,6 +9459,7 @@ void bgp_terminate(void)
 	event_cancel(&bm->t_bgp_zebra_l2_vni);
 
 	bgp_mac_finish();
+	bgp_mup_master_finish();
 #ifdef ENABLE_BGP_VNC
 	rfapi_terminate();
 #endif

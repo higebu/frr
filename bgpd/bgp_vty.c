@@ -51,6 +51,7 @@
 #include "bgpd/bgp_regex.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_vty.h"
@@ -11709,9 +11710,9 @@ DEFUN_NOSH (address_family_ipv4_safi,
 		safi_t safi = bgp_vty_safi_from_str(argv[2]->text);
 		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT
 		    && safi != SAFI_UNICAST && safi != SAFI_MULTICAST
-		    && safi != SAFI_EVPN) {
+		    && safi != SAFI_EVPN && safi != SAFI_MUP) {
 			vty_out(vty,
-				"Only Unicast/Multicast/EVPN SAFIs supported in non-core instances.\n");
+				"Only Unicast/Multicast/EVPN/MUP SAFIs supported in non-core instances.\n");
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		vty->node = bgp_node_type(AFI_IP, safi);
@@ -11733,9 +11734,9 @@ DEFUN_NOSH (address_family_ipv6_safi,
 		safi_t safi = bgp_vty_safi_from_str(argv[2]->text);
 		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT
 		    && safi != SAFI_UNICAST && safi != SAFI_MULTICAST
-		    && safi != SAFI_EVPN) {
+		    && safi != SAFI_EVPN && safi != SAFI_MUP) {
 			vty_out(vty,
-				"Only Unicast/Multicast/EVPN SAFIs supported in non-core instances.\n");
+				"Only Unicast/Multicast/EVPN/MUP SAFIs supported in non-core instances.\n");
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		vty->node = bgp_node_type(AFI_IP6, safi);
@@ -21877,6 +21878,9 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 
 	if (safi == SAFI_MPLS_VPN)
 		bgp_vpn_config_write(vty, bgp, afi, safi);
+
+	if (safi == SAFI_MUP)
+		bgp_mup_config_write_af(vty, bgp, afi);
 
 	if (safi == SAFI_UNICAST) {
 		bgp_vpn_policy_config_write_afi(vty, bgp, afi);

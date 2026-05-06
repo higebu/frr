@@ -20,6 +20,8 @@
 
 PREDECL_LIST(zebra_announce);
 PREDECL_LIST(zebra_l2_vni);
+PREDECL_LIST(bgp_mup_pending_list);
+PREDECL_LIST(bgp_mup_origin_list);
 PREDECL_HASH(bgp_mup_isd_hash);
 PREDECL_HASH(bgp_mup_dsd_hash);
 PREDECL_HASH(bgp_mup_dsd_segid_hash);
@@ -152,6 +154,15 @@ struct bgp_master {
 
 	/* The Mac table */
 	struct hash *self_mac_hash;
+
+	/* BGP-MUP self-originated key indexes.  Populated when a `segment`
+	 * line on any per-vrf bgp instance is persisted, drained on forget
+	 * / instance teardown.  Lets bgp_mup_{isd,dsd}_is_self() answer in
+	 * O(1) on every received T1ST/T2ST install instead of walking
+	 * (per-vrf bgp instance) x (origins per instance).
+	 */
+	struct hash *mup_self_isd_hash;
+	struct hash *mup_self_dsd_hash;
 
 	/* BGP start time.  */
 	time_t start_time;
@@ -1089,6 +1100,18 @@ struct bgp {
 
 	/* BGP L3 service IPv4/v6 SRv6 backend */
 	struct srv6_policy srv6_unicast[AFI_MAX];
+
+	/* BGP-MUP origination: pending segment_interwork/direct waiting for
+	 * an SRv6 SID from zebra's SID manager.  See bgp_mup.c for the
+	 * struct (opaque here to avoid pulling bgp_mup.h into bgpd.h).
+	 */
+	struct bgp_mup_pending_list_head *mup_pending;
+
+	/* BGP-MUP origination: persistent record of `segment` commands
+	 * configured under address-family ipv4|ipv6 mup.  Survives SID
+	 * alloc/release cycles so we can re-emit the running config.
+	 */
+	struct bgp_mup_origin_list_head *mup_origins;
 
 	/* BGP-MUP discovery cache: received ISD/DSD routes used to resolve
 	 * incoming T1ST/T2ST routes (draft-ietf-bess-mup-safi Section 3.3.9 /
