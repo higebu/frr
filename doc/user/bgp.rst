@@ -4386,6 +4386,228 @@ This makes it possible to separate not only layer 3 networks like VRF-lite netwo
 Also, VRF netns based make possible to separate layer 2 networks on separate VRF
 instances.
 
+.. _bgp-mup:
+
+BGP Mobile User Plane (MUP) SAFI
+--------------------------------
+
+FRR supports the BGP Mobile User Plane SAFI defined in
+`draft-ietf-bess-mup-safi
+<https://datatracker.ietf.org/doc/draft-ietf-bess-mup-safi/>`_,
+which lets BGP advertise the session state required to bridge GTP-U
+and SRv6 forwarding planes in an SRv6 Mobile User Plane deployment.
+The SAFI carries four route types: Type 1 (Interwork Segment
+Discovery), Type 2 (Direct Segment Discovery), Type 3 (Type 1
+Session Transformed) and Type 4 (Type 2 Session Transformed).  The
+routes complement the SRv6 mobile user plane endpoint behaviours
+specified in :rfc:`9433`.
+
+The IPv4 and IPv6 sub-AFIs are activated independently on each
+peering:
+
+.. code-block:: frr
+
+   router bgp 65000
+    neighbor 2001:db8::1 remote-as 65000
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8::1 activate
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8::1 activate
+    exit-address-family
+
+Activating these address families causes the local speaker to
+advertise the BGP Multiprotocol capability for IPv4 and IPv6 Mobile
+User Plane and parse all four route types.
+
+Route Origination
+^^^^^^^^^^^^^^^^^
+
+Mobile User Plane routes are originated from a non-default VRF
+``router bgp`` instance.  An address family enables either
+``segment interwork`` for Interwork Segment Discovery, or
+``segment direct`` for Direct Segment Discovery.
+
+Interwork Segment Discovery advertises N3-side (gNB-facing) IP
+reachability through an interworking SRv6 endpoint.  Prefixes are
+injected with ``network`` and ``redistribute <protocol>`` under the
+Mobile User Plane address family, and every locally-originated
+entry produces one Interwork Segment Discovery route.
+
+Direct Segment Discovery advertises a direct-mode SRv6 endpoint for
+the VRF as a single route, used in the 3GPP 5G N6 / DN direction
+where no GTP-U interworking is required.
+
+A configured SRv6 locator must be referenced under
+``router bgp / segment-routing srv6 / locator <name>`` before
+origination is enabled.  When the route distinguisher and a segment
+selector are both set, FRR requests the necessary SRv6 SIDs from
+zebra and starts emitting routes.
+
+.. clicmd:: rd <AS:NN|IP:nn>
+
+   Route distinguisher attached to locally-originated routes.
+
+.. clicmd:: rt <import|export|both> RTLIST...
+
+   Route Target list applied to Mobile User Plane routes.
+   ``import`` matches received routes for installation into this
+   VRF; ``export`` is set on every locally-originated route;
+   ``both`` applies the list to both directions.
+
+.. clicmd:: route-map <import|export> RMAP
+
+   Route-map applied to received routes (``import``) or
+   locally-originated routes (``export``).
+
+.. clicmd:: sid <auto|explicit X:X::X:X> [locator NAME]
+
+   SRv6 prefix-SID attached to locally-originated routes.  ``auto``
+   requests a SID from the configured locator; ``explicit`` pins a
+   specific SID value.  The optional ``locator`` keyword overrides
+   the BGP instance default for this single address family.
+
+.. clicmd:: nexthop [A.B.C.D|X:X::X:X]
+
+   Override the next-hop carried on locally-originated routes.
+   IPv4 input is stored as an IPv4-mapped IPv6 address, since
+   Mobile User Plane routes always carry an IPv6 next-hop on the
+   wire.
+
+.. clicmd:: segment vrftable (1-4294967295)
+
+   SR-underlay VRF table id (``SEG6_MOBILE_VRFTABLE``) used for the
+   post-action FIB lookup of every locally-installed Mobile User Plane
+   lwtunnel — both received T1ST/T2ST routes and (when the originate
+   path is wired) the local SIDs allocated for Interwork Segment
+   Discovery.  The Linux kernel rejects the install without
+   ``net.vrf.strict_mode=1`` plus a VRF device bound to the table, so
+   the knob has no useful default and must be configured before any
+   install can land.  Configured on the default-vrf BGP instance,
+   where the BGP-MUP session itself lives.
+
+.. clicmd:: segment interwork
+
+   Enable Interwork Segment Discovery origination.
+
+.. clicmd:: segment direct
+
+   Enter the Direct Segment Discovery configuration block.
+
+   .. clicmd:: address A.B.C.D
+
+      Direct Segment Discovery originating-speaker address;
+      defaults to the BGP router-id.
+
+   .. clicmd:: behavior <dt4|dt6|dt46>
+
+      End.DT4, End.DT6 or End.DT46 endpoint behaviour for the
+      Direct Segment Discovery SID, selected according to the
+      decapsulated payload's IP family.
+
+   .. clicmd:: segment-id ASN:NN
+
+      BGP MUP Extended Community Direct-Type Segment Identifier
+      carried on the Direct Segment Discovery route.
+
+Example configuration:
+
+.. code-block:: frr
+
+   segment-routing
+    srv6
+     locators
+      locator default
+       prefix 2001:db8:e::/48 block-len 24 node-len 24 func-bits 8
+   !
+   router bgp 65001
+    bgp router-id 1.1.1.1
+    neighbor 2001:db8::2 remote-as 65002
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8::2 activate
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8::2 activate
+    exit-address-family
+   exit
+   !
+   ! Interwork Segment Discovery origination on slice1.
+   router bgp 65001 vrf slice1
+    bgp router-id 1.1.1.1
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     redistribute connected
+     rd 100:100
+     rt export 65001:1
+     sid auto
+     segment interwork
+    exit-address-family
+    !
+    address-family ipv6 mup
+     redistribute connected
+     rd 200:200
+     rt export 65001:2
+     sid auto
+     segment interwork
+    exit-address-family
+   exit
+   !
+   ! Direct Segment Discovery origination on slice2.
+   router bgp 65001 vrf slice2
+    bgp router-id 1.1.1.1
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     rd 300:300
+     rt export 65001:1
+     sid auto
+     segment direct
+      address 10.0.0.250
+      behavior dt4
+      segment-id 65001:10
+     exit
+    exit-address-family
+   exit
+
+FRR originates only Interwork Segment Discovery and Direct Segment
+Discovery routes; Type 1 and Type 2 Session Transformed route
+origination is not exposed.
+
+Route Import
+^^^^^^^^^^^^
+
+A non-default VRF ``router bgp`` instance imports received Mobile
+User Plane routes whose Route Target extended community matches one
+of its configured ``rt import`` (or ``rt both``) targets.  A VRF
+without an ``rt import`` line imports no routes.  Origination-side
+``rt export`` lines are not implicit imports; the export and import
+target lists are independent.
+
+A receive-only configuration looks like this:
+
+.. code-block:: frr
+
+   router bgp 65002 vrf slice1
+    address-family ipv4 mup
+     rt import 65001:1
+    exit-address-family
+   exit
+
 .. _bgp-conditional-advertisement:
 
 BGP Conditional Advertisement
