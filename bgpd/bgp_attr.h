@@ -12,6 +12,7 @@
 #include "bgpd/bgp_encap_types.h"
 #include "bgpd/bgp_attr_srv6.h"
 #include "srte.h"
+#include "srv6.h"
 
 /* Simple bit mapping. */
 #define BITMAP_NBBY 8
@@ -296,6 +297,9 @@ struct attr {
 	/* BGP-MUP NLRI optional TLVs, re-encoded verbatim on re-advertisement. */
 	struct bgp_mup_nlri_data *mup_nlri_data;
 
+	/* Resolved BGP-MUP forwarding state on a leaked unicast path. */
+	struct bgp_mup_fwd *mup_fwd;
+
 	struct in_addr mp_nexthop_global_in;
 
 	/* Aggregator Router ID attribute */
@@ -378,6 +382,32 @@ struct transit {
 };
 
 PREDECL_HASH(mup_nlri_data_hash);
+PREDECL_HASH(mup_fwd_hash);
+
+/* Forwarding state resolved for a received BGP-MUP T1ST/T2ST route.  It
+ * rides on the path leaked into the per-vrf unicast RIB so the zebra
+ * announce can rebuild the seg6 / seg6_mobile nexthop, the same way
+ * srv6_l3service carries the VPN SID for an L3VPN path.
+ */
+struct bgp_mup_fwd {
+	unsigned long refcnt;
+	struct mup_fwd_hash_item hash_item;
+
+	/* Everything below is hashed and compared as one byte range. */
+	uint8_t nh_type;
+	vrf_id_t nh_vrf_id;
+	ifindex_t ifindex;
+	struct in6_addr gate;
+	struct in6_addr segs[2];
+	uint8_t seg_num;
+	enum srv6_headend_behavior encap_behavior;
+	struct in6_addr encap_source;
+	uint32_t seg6_mobile_action;
+	struct seg6_mobile_ctx seg6_mobile_ctx;
+};
+
+#define BGP_MUP_FWD_CMP_OFFSET offsetof(struct bgp_mup_fwd, nh_type)
+#define BGP_MUP_FWD_CMP_LEN    (sizeof(struct bgp_mup_fwd) - BGP_MUP_FWD_CMP_OFFSET)
 
 /* The non-key part of a BGP-MUP T1ST/T2ST NLRI body: for T1ST the
  * architecture specific fields plus any TLVs, for T2ST the optional TLVs
@@ -692,6 +722,16 @@ static inline void bgp_attr_set_mup_nlri_data(struct attr *attr, struct bgp_mup_
 	attr->mup_nlri_data = tlvs;
 }
 
+static inline struct bgp_mup_fwd *bgp_attr_get_mup_fwd(const struct attr *attr)
+{
+	return attr->mup_fwd;
+}
+
+static inline void bgp_attr_set_mup_fwd(struct attr *attr, struct bgp_mup_fwd *fwd)
+{
+	attr->mup_fwd = fwd;
+}
+
 static inline struct bgp_nhc *bgp_attr_get_nhc(const struct attr *attr)
 {
 	return attr->extra ? attr->extra->nhc : NULL;
@@ -919,6 +959,9 @@ extern struct bgp_route_evpn *evpn_overlay_intern(struct bgp_route_evpn *bre);
 extern struct bgp_mup_nlri_data *mup_nlri_data_new(const uint8_t *val, uint16_t length);
 extern struct bgp_mup_nlri_data *mup_nlri_data_intern(struct bgp_mup_nlri_data *tlvs);
 extern void mup_nlri_data_unintern(struct bgp_mup_nlri_data **tlvsp);
+extern struct bgp_mup_fwd *mup_fwd_new(void);
+extern struct bgp_mup_fwd *mup_fwd_intern(struct bgp_mup_fwd *fwd);
+extern void mup_fwd_unintern(struct bgp_mup_fwd **fwdp);
 
 extern int bgp_attr_stream_put_labeled_prefix(struct stream *s, const struct prefix *p,
 					      mpls_label_t *labels, uint8_t num_labels,

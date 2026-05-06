@@ -52,4 +52,49 @@ struct bgp_mup_nlri_data;
 extern void bgp_mup_nlri_data_show(const struct bgp_mup_nlri_data *tlvs, uint16_t route_type,
 				   struct vty *vty, struct json_object *json_path);
 
+/* Translate a selected BGP-MUP route into a zapi route programming the
+ * appropriate SRv6 Mobile User Plane action in the kernel.  Returns
+ * the zclient send status (ZCLIENT_SEND_SUCCESS when no kernel state
+ * is required for the route, e.g. ISD/DSD discovery routes that only
+ * influence other route types' processing).
+ */
+extern int bgp_mup_zebra_announce(struct bgp_dest *dest, struct bgp_path_info *info,
+				  struct bgp *bgp);
+extern int bgp_mup_zebra_withdraw(struct bgp_dest *dest, struct bgp_path_info *info,
+				  struct bgp *bgp);
+
+/* Free the per-bgp ISD/DSD discovery caches (called from bgp_free). */
+extern void bgp_mup_caches_free(struct bgp *bgp);
+
+/* Free the per-(vrf, afi) MUP export policy (called from bgp_free). */
+extern void bgp_mup_export_clear(struct bgp *bgp, afi_t afi);
+
+/* Emit BGP-MUP per-AFI commands under `address-family ipv4|ipv6 mup`
+ * (placeholder for future SAFI-global knobs).  Called from bgp_vty.c.
+ */
+extern void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi);
+
+/* Emit per-(vrf, afi) MUP-policy lines under
+ * `address-family ipv[46] unicast`.  Sibling of L3VPN's
+ * `rd vpn export` / `rt vpn <import|export|both>` writeback.
+ */
+extern void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, int indent);
+
+/* Register BGP-MUP CLI commands under BGP_IPV4_MUP_NODE / BGP_IPV6_MUP_NODE. */
+extern void bgp_mup_vty_init(void);
+
+/* Invalidate the process-wide iface-state caches used by T1ST/T2ST
+ * install (local IPv6 source, locator OIF).  Called from bgp_zebra.c
+ * on every connected-address add/delete in @vrf_id.
+ */
+extern void bgp_mup_iface_addr_change(vrf_id_t vrf_id);
+
+/* Replay every installed T1ST/T2ST after the SRv6 `encap-behavior` knob
+ * changed.  Called from bgp_vty.c.
+ */
+extern void bgp_mup_srv6_encap_behavior_changed(void);
+
+/* Free the process-wide BGP-MUP caches (called from bgp_exit). */
+extern void bgp_mup_finish(void);
+
 #endif /* _FRR_BGP_MUP_H */

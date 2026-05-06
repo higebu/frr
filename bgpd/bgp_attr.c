@@ -53,6 +53,7 @@
 #include "bgpd/bgp_unreach.h"
 
 DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_NLRI_DATA, "BGP MUP NLRI TLVs");
+DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_FWD, "BGP MUP forwarding state");
 
 /* Attribute strings for logging. */
 static const struct message attr_str[] = {
@@ -779,6 +780,88 @@ static void mup_nlri_data_finish(void)
 	mup_nlri_data_hash_fini(&mup_nlri_data_head);
 }
 
+/* BGP-MUP resolved forwarding state, interned per unique nexthop. */
+static int mup_fwd_hash_cmp(const struct bgp_mup_fwd *fwd1, const struct bgp_mup_fwd *fwd2)
+{
+	return memcmp((const uint8_t *)fwd1 + BGP_MUP_FWD_CMP_OFFSET,
+		      (const uint8_t *)fwd2 + BGP_MUP_FWD_CMP_OFFSET, BGP_MUP_FWD_CMP_LEN);
+}
+
+static uint32_t mup_fwd_hash_key(const struct bgp_mup_fwd *fwd)
+{
+	return jhash((const uint8_t *)fwd + BGP_MUP_FWD_CMP_OFFSET, BGP_MUP_FWD_CMP_LEN, 0);
+}
+
+DECLARE_HASH(mup_fwd_hash, struct bgp_mup_fwd, hash_item, mup_fwd_hash_cmp, mup_fwd_hash_key);
+
+static struct mup_fwd_hash_head mup_fwd_head;
+
+static void mup_fwd_free(struct bgp_mup_fwd *fwd)
+{
+	XFREE(MTYPE_BGP_MUP_FWD, fwd);
+}
+
+struct bgp_mup_fwd *mup_fwd_new(void)
+{
+	return XCALLOC(MTYPE_BGP_MUP_FWD, sizeof(struct bgp_mup_fwd));
+}
+
+struct bgp_mup_fwd *mup_fwd_intern(struct bgp_mup_fwd *fwd)
+{
+	struct bgp_mup_fwd *find;
+
+	find = mup_fwd_hash_find(&mup_fwd_head, fwd);
+	if (!find) {
+		mup_fwd_hash_add(&mup_fwd_head, fwd);
+		find = fwd;
+	} else if (find != fwd) {
+		mup_fwd_free(fwd);
+	}
+
+	find->refcnt++;
+	return find;
+}
+
+void mup_fwd_unintern(struct bgp_mup_fwd **fwdp)
+{
+	struct bgp_mup_fwd *fwd = *fwdp;
+
+	if (!fwd)
+		return;
+
+	if (fwd->refcnt)
+		fwd->refcnt--;
+
+	if (fwd->refcnt == 0) {
+		mup_fwd_hash_del(&mup_fwd_head, fwd);
+		mup_fwd_free(fwd);
+	}
+	*fwdp = NULL;
+}
+
+static bool mup_fwd_same(const struct bgp_mup_fwd *fwd1, const struct bgp_mup_fwd *fwd2)
+{
+	if (fwd1 == fwd2)
+		return true;
+	if (!fwd1 || !fwd2)
+		return false;
+	return mup_fwd_hash_cmp(fwd1, fwd2) == 0;
+}
+
+static void mup_fwd_init(void)
+{
+	mup_fwd_hash_init(&mup_fwd_head);
+}
+
+static void mup_fwd_finish(void)
+{
+	struct bgp_mup_fwd *fwd;
+
+	while ((fwd = mup_fwd_hash_pop(&mup_fwd_head)))
+		mup_fwd_free(fwd);
+	mup_fwd_hash_fini(&mup_fwd_head);
+}
+
 static bool bgp_nhc_same(const struct bgp_nhc *nhc1, const struct bgp_nhc *nhc2)
 {
 	const struct bgp_nhc_tlv *p;
@@ -1194,6 +1277,8 @@ unsigned int attrhash_key_make(const void *p)
 		MIX(evpn_overlay_hash_key_make(bgp_attr_get_evpn_overlay(attr)));
 	if (bgp_attr_get_mup_nlri_data(attr))
 		MIX(mup_nlri_data_hash_key(bgp_attr_get_mup_nlri_data(attr)));
+	if (bgp_attr_get_mup_fwd(attr))
+		MIX(mup_fwd_hash_key(bgp_attr_get_mup_fwd(attr)));
 	if (bgp_attr_get_srv6_vpn(attr))
 		MIX(srv6_vpn_hash_key_make(bgp_attr_get_srv6_vpn(attr)));
 #ifdef ENABLE_BGP_VNC
@@ -1256,6 +1341,7 @@ bool attrhash_cmp(const void *p1, const void *p2)
 		    overlay_index_same(attr1, attr2) &&
 		    mup_nlri_data_same(bgp_attr_get_mup_nlri_data(attr1),
 				       bgp_attr_get_mup_nlri_data(attr2)) &&
+		    mup_fwd_same(bgp_attr_get_mup_fwd(attr1), bgp_attr_get_mup_fwd(attr2)) &&
 		    !memcmp(&attr1->esi, &attr2->esi, sizeof(esi_t)) &&
 		    attr1->es_flags == attr2->es_flags && attr1->mm_seqnum == attr2->mm_seqnum &&
 		    attr1->mm_sync_seqnum == attr2->mm_sync_seqnum &&
@@ -1507,6 +1593,17 @@ struct attr *bgp_attr_intern(struct attr *attr)
 							   mup_nlri_data_intern(mup_nlri_data));
 			else
 				mup_nlri_data->refcnt++;
+		}
+	}
+
+	{
+		struct bgp_mup_fwd *mup_fwd = bgp_attr_get_mup_fwd(attr);
+
+		if (mup_fwd) {
+			if (!mup_fwd->refcnt)
+				bgp_attr_set_mup_fwd(attr, mup_fwd_intern(mup_fwd));
+			else
+				mup_fwd->refcnt++;
 		}
 	}
 
@@ -1818,6 +1915,13 @@ void bgp_attr_unintern_sub(struct attr *attr)
 		bgp_attr_set_mup_nlri_data(attr, NULL);
 	}
 
+	{
+		struct bgp_mup_fwd *mup_fwd = bgp_attr_get_mup_fwd(attr);
+
+		mup_fwd_unintern(&mup_fwd);
+		bgp_attr_set_mup_fwd(attr, NULL);
+	}
+
 	ls_attr = bgp_attr_get_ls_attr(attr);
 	bgp_ls_attr_unintern(&ls_attr);
 	bgp_attr_set_ls_attr(attr, NULL);
@@ -1949,6 +2053,13 @@ void bgp_attr_flush(struct attr *attr)
 	if (mup_nlri_data && !mup_nlri_data->refcnt) {
 		mup_nlri_data_free(mup_nlri_data);
 		bgp_attr_set_mup_nlri_data(attr, NULL);
+	}
+
+	struct bgp_mup_fwd *mup_fwd = bgp_attr_get_mup_fwd(attr);
+
+	if (mup_fwd && !mup_fwd->refcnt) {
+		mup_fwd_free(mup_fwd);
+		bgp_attr_set_mup_fwd(attr, NULL);
 	}
 
 	struct bgp_ls_attr *ls_attr = bgp_attr_get_ls_attr(attr);
@@ -6325,6 +6436,7 @@ void bgp_attr_init(void)
 	srv6_init();
 	evpn_overlay_init();
 	mup_nlri_data_init();
+	mup_fwd_init();
 	nhc_init();
 }
 
@@ -6341,6 +6453,7 @@ void bgp_attr_finish(void)
 	srv6_finish();
 	evpn_overlay_finish();
 	mup_nlri_data_finish();
+	mup_fwd_finish();
 	nhc_finish();
 }
 

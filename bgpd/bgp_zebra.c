@@ -47,6 +47,7 @@
 #endif
 #include "bgpd/bgp_evpn.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_labelpool.h"
 #include "bgpd/bgp_pbr.h"
 #include "bgpd/bgp_evpn_private.h"
@@ -342,6 +343,8 @@ static int bgp_interface_address_add(ZAPI_CALLBACK_ARGS)
 
 	frrtrace(4, frr_bgp, interface_address_oper_zrecv, vrf_id, ifc->ifp->name, ifc->address, 1);
 
+	bgp_mup_iface_addr_change(vrf_id);
+
 	if (!bgp)
 		return 0;
 
@@ -425,6 +428,8 @@ static int bgp_interface_address_delete(ZAPI_CALLBACK_ARGS)
 			   ifc->ifp->vrf->name, ifc->ifp->name, ifc->address);
 
 	frrtrace(4, frr_bgp, interface_address_oper_zrecv, vrf_id, ifc->ifp->name, ifc->address, 2);
+
+	bgp_mup_iface_addr_change(vrf_id);
 
 	if (bgp && if_is_operative(ifc->ifp)) {
 		bgp_connected_delete(bgp, ifc);
@@ -1289,6 +1294,35 @@ static bool bgp_zebra_use_nhop_weighted(struct bgp *bgp, struct bgp_path_info *b
 	return true;
 }
 
+/* Rebuild the nexthop a BGP-MUP T1ST/T2ST resolved before it was leaked
+ * into this vrf's unicast RIB.  The attr nexthop is what best-path
+ * compared on; the forwarding state is the one the MUP route carried.
+ */
+static void bgp_zebra_nexthop_set_mup(struct zapi_nexthop *api_nh, const struct bgp_mup_fwd *fwd)
+{
+	uint8_t i;
+
+	api_nh->type = fwd->nh_type;
+	api_nh->vrf_id = fwd->nh_vrf_id;
+	api_nh->ifindex = fwd->ifindex;
+	api_nh->gate.ipv6 = fwd->gate;
+
+	api_nh->seg_num = fwd->seg_num;
+	for (i = 0; i < fwd->seg_num && i < array_size(fwd->segs); i++)
+		api_nh->seg6_segs[i] = fwd->segs[i];
+	if (fwd->seg_num)
+		SET_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_SEG6);
+
+	api_nh->srv6_encap_behavior = fwd->encap_behavior;
+	api_nh->srv6_encap_source = fwd->encap_source;
+
+	if (fwd->seg6_mobile_action != ZEBRA_SEG6_MOBILE_ACTION_UNSPEC) {
+		api_nh->seg6_mobile_action = fwd->seg6_mobile_action;
+		api_nh->seg6_mobile_ctx = fwd->seg6_mobile_ctx;
+		SET_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_SEG6_MOBILE);
+	}
+}
+
 static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const struct prefix *p,
 					     struct bgp *bgp, struct zapi_route *api,
 					     unsigned int *valid_nh_count, afi_t afi, safi_t safi,
@@ -1338,6 +1372,13 @@ static void bgp_zebra_announce_parse_nexthop(struct bgp_path_info *info, const s
 
 		*mpinfo_cp = *mpinfo;
 		nh_weight = 0;
+
+		if (bgp_attr_get_mup_fwd(mpinfo_cp->attr)) {
+			api_nh = &api->nexthops[*valid_nh_count];
+			bgp_zebra_nexthop_set_mup(api_nh, bgp_attr_get_mup_fwd(mpinfo_cp->attr));
+			(*valid_nh_count)++;
+			continue;
+		}
 
 		/* Get nexthop address-family */
 		if (p->family == AF_INET &&
@@ -1621,6 +1662,11 @@ enum zclient_send_status bgp_zebra_announce_actual(struct bgp_dest *dest,
 		return ZCLIENT_SEND_SUCCESS;
 	}
 
+	if (table->safi == SAFI_MUP) {
+		bgp_mup_zebra_announce(dest, info, bgp);
+		return ZCLIENT_SEND_SUCCESS;
+	}
+
 	zapi_route_init(&api);
 
 	/* Make Zebra API structure. */
@@ -1699,6 +1745,12 @@ enum zclient_send_status bgp_zebra_announce_actual(struct bgp_dest *dest,
 	}
 
 	if (allow_recursion)
+		SET_FLAG(api.flags, ZEBRA_FLAG_ALLOW_RECURSION);
+
+	/* A leaked BGP-MUP path resolves on an SRv6 SID reachable through the
+	 * SR underlay, which is never a connected nexthop.
+	 */
+	if (bgp_attr_get_mup_fwd(info->attr))
 		SET_FLAG(api.flags, ZEBRA_FLAG_ALLOW_RECURSION);
 
 	/*
@@ -1822,6 +1874,11 @@ enum zclient_send_status bgp_zebra_withdraw_actual(struct bgp_dest *dest,
 		peer = info->peer;
 		bgp_pbr_update_entry(peer->bgp, p, info, table->afi,
 				     table->safi, false);
+		return ZCLIENT_SEND_SUCCESS;
+	}
+
+	if (table->safi == SAFI_MUP) {
+		bgp_mup_zebra_withdraw(dest, info, bgp);
 		return ZCLIENT_SEND_SUCCESS;
 	}
 
