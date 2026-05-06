@@ -4386,6 +4386,122 @@ This makes it possible to separate not only layer 3 networks like VRF-lite netwo
 Also, VRF netns based make possible to separate layer 2 networks on separate VRF
 instances.
 
+.. _bgp-mup:
+
+BGP Mobile User Plane (MUP) SAFI
+--------------------------------
+
+FRR implements the BGP Mobile User Plane SAFI defined in
+`draft-ietf-bess-mup-safi
+<https://datatracker.ietf.org/doc/draft-ietf-bess-mup-safi/>`_.  The
+SAFI carries four route types used by an SRv6 Mobile User Plane
+(SRv6-MUP) deployment between Provider Edges and a MUP Controller:
+
+  - Type 1 - Interwork Segment Discovery (ISD)
+  - Type 2 - Direct Segment Discovery (DSD)
+  - Type 3 - Type 1 Session Transformed (T1ST)
+  - Type 4 - Type 2 Session Transformed (T2ST)
+
+Together with the SRv6 mobile-uplane behaviours defined in RFC 9433
+(End.M.GTP4.E, End.M.GTP6.D, End.M.GTP6.D.Di, End.M.GTP6.E,
+H.M.GTP4.D, End.MAP), the BGP-MUP SAFI lets BGP advertise the
+session state required to bridge GTP-U and SRv6 forwarding planes.
+
+Enabling BGP-MUP on a peering
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The IPv4 and IPv6 sub-AFIs are activated independently:
+
+.. code-block:: frr
+
+   router bgp 65000
+    neighbor 2001:db8::1 remote-as 65000
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8::1 activate
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8::1 activate
+    exit-address-family
+
+Activating these address families causes the local speaker to
+advertise the BGP MP capability for ``AFI=IPv4|IPv6, SAFI=85`` and
+parse all four route types per draft-ietf-bess-mup-safi.
+
+Originating ISD / DSD as a MUP-PE / MUP-GW
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When FRR plays the MUP-PE / MUP-GW role, the operator declares the
+prefixes (or endpoint addresses) the local speaker is willing to
+serve via the ``segment interwork`` and ``segment direct`` commands.
+A configured SRv6 locator must be referenced under
+``router bgp / segment-routing srv6 / locator <name>`` first; bgpd
+then asks zebra's SRv6 SID manager to allocate a function under that
+locator for each segment, mirroring the existing ``sid vpn export
+auto`` flow.
+
+.. clicmd:: [no] segment interwork <A.B.C.D/M|X:X::X:X/M> rd <RD> rt <RT> [sid explicit X:X::X:X]
+
+   Originate an Interwork Segment Discovery (ISD) route covering the
+   given UE prefix.  Per draft-ietf-bess-mup-safi Section 3.3.1 the
+   prefix-SID's behavior MUST be ``End.M.GTP4.E`` for the IPv4 sub-AFI
+   and ``End.M.GTP6.E`` for the IPv6 sub-AFI; the behavior is selected
+   automatically.  ``sid explicit`` is an escape hatch for inter-AS or
+   migration scenarios that need a pinned SID value; otherwise the
+   function bits are auto-allocated by zebra.
+
+.. clicmd:: [no] segment direct <A.B.C.D|X:X::X:X> rd <RD> rt <RT> mup <ASN:NN> behavior <dt4|dt6|dt46> [sid explicit X:X::X:X]
+
+   Originate a Direct Segment Discovery (DSD) route.  ``<ADDR>`` is
+   the DSD NLRI's *Address* field per draft-ietf-bess-mup-safi
+   §3.1.2 — the address of the originating BGP speaker; in the 3GPP
+   5G architecture this is typically the UPF host's IP.
+
+   ``behavior`` selects the prefix-SID's End.DT* function and is
+   mandatory: per draft §3.3.4 the function MAY be ``End.DT4`` /
+   ``End.DT6`` / ``End.DT46``, with the choice driven by the inner
+   PDU lookup AFI (PDU session type), which is independent of the
+   DSD Address AFI.  The operator must therefore declare it
+   explicitly — there is no AFI-derived default.
+
+   The ``mup`` keyword carries the MUP Extended Community.
+
+Example:
+
+.. code-block:: frr
+
+   segment-routing
+    srv6
+     locators
+      locator default
+       prefix 2001:db8:e::/64 block-len 40 node-len 24 func-bits 16
+   !
+   router bgp 65001
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8:2::2 activate
+     segment interwork 10.99.0.0/24 rd 100:100 rt 65001:1
+     segment direct 10.0.0.250 rd 100:100 rt 65001:1 mup 65001:10 behavior dt4
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8:2::2 activate
+     segment interwork 2001:db8:99::/64 rd 200:200 rt 65001:2
+    exit-address-family
+
+Note that **ISD and DSD origination is control-plane only**.  No
+seg6local forwarding state is installed on the originating MUP-GW as a
+side effect — the SID advertised in ISD/DSD is the locator + function
+base, and per-session forwarding state lands on the receiver-side MUP
+nodes when an external MUP-Controller distributes Type 1 / Type 2
+Session Transformed (T1ST/T2ST) routes that point under that base.
+T1ST / T2ST origination is therefore intentionally not exposed by
+FRR; it is the MUP-Controller's responsibility.
+
 .. _bgp-conditional-advertisement:
 
 BGP Conditional Advertisement
