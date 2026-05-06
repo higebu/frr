@@ -47,6 +47,7 @@
 #endif
 #include "bgpd/bgp_evpn.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_labelpool.h"
 #include "bgpd/bgp_pbr.h"
 #include "bgpd/bgp_evpn_private.h"
@@ -1622,6 +1623,11 @@ enum zclient_send_status bgp_zebra_announce_actual(struct bgp_dest *dest,
 		return ZCLIENT_SEND_SUCCESS;
 	}
 
+	if (table->safi == SAFI_MUP) {
+		bgp_mup_zebra_announce(dest, info, bgp);
+		return ZCLIENT_SEND_SUCCESS;
+	}
+
 	zapi_route_init(&api);
 
 	/* Make Zebra API structure. */
@@ -1816,6 +1822,11 @@ enum zclient_send_status bgp_zebra_withdraw_actual(struct bgp_dest *dest,
 		peer = info->peer;
 		bgp_pbr_update_entry(peer->bgp, p, info, table->afi,
 				     table->safi, false);
+		return ZCLIENT_SEND_SUCCESS;
+	}
+
+	if (table->safi == SAFI_MUP) {
+		bgp_mup_zebra_withdraw(dest, info, bgp);
 		return ZCLIENT_SEND_SUCCESS;
 	}
 

@@ -33,6 +33,7 @@
 #include "bitfield.h"
 
 #include "bgpd/bgpd.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_route.h"
@@ -4747,6 +4748,7 @@ void bgp_free(struct bgp *bgp)
 	bgp_scan_finish(bgp);
 	bgp_address_destroy(bgp);
 	bgp_tip_hash_destroy(bgp);
+	bgp_mup_caches_free(bgp);
 
 	/* release the auto RD id */
 	bf_release_index(bm->rd_idspace, bgp->vrf_rd_id);
