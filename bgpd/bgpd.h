@@ -20,6 +20,11 @@
 
 PREDECL_LIST(zebra_announce);
 PREDECL_LIST(zebra_l2_vni);
+PREDECL_HASH(bgp_mup_isd_hash);
+PREDECL_HASH(bgp_mup_dsd_hash);
+PREDECL_HASH(bgp_mup_dsd_segid_hash);
+
+struct route_table;
 
 enum bgp_bp_install_type {
 	BGP_BP_INSTALL_ROUTE,
@@ -1084,6 +1089,27 @@ struct bgp {
 
 	/* BGP L3 service IPv4/v6 SRv6 backend */
 	struct srv6_policy srv6_unicast[AFI_MAX];
+
+	/* BGP-MUP discovery cache: received ISD/DSD routes used to resolve
+	 * incoming T1ST/T2ST routes (draft-ietf-bess-mup-safi Section 3.3.9 /
+	 * Section 3.3.12).  Opaque from bgpd.h's perspective; structures live in
+	 * bgp_mup.c.
+	 *
+	 * ISD: exact-match hash on (afi, prd, prefix) + per-AFI route_table for
+	 * LPM lookup of an ISD covering a T1ST endpoint.
+	 * DSD: exact-match hash on (afi, prd, endpoint) + segment_id hash for
+	 * T2ST resolution.
+	 */
+	struct bgp_mup_isd_hash_head *mup_isd_hash;
+	struct route_table *mup_isd_lpm[AFI_MAX];
+	struct bgp_mup_dsd_hash_head *mup_dsd_hash;
+	struct bgp_mup_dsd_segid_hash_head *mup_dsd_segid_hash;
+
+	/* BGP-MUP discovery cache: pending coalesced reannounce of T1ST/T2ST
+	 * paths after ISD/DSD cache mutation.  One slot per AFI; a flood of
+	 * cache mutations within a single UPDATE collapses to one RIB walk.
+	 */
+	struct event *mup_reannounce_ev[AFI_MAX];
 
 	/* TCP keepalive parameters for BGP connection */
 	uint16_t tcp_keepalive_idle;

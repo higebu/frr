@@ -648,9 +648,8 @@ static inline void bgp_bump_version(struct bgp_dest *dest)
 
 static inline int bgp_fibupd_safi(safi_t safi)
 {
-	if (safi == SAFI_UNICAST || safi == SAFI_MULTICAST
-	    || safi == SAFI_LABELED_UNICAST
-	    || safi == SAFI_FLOWSPEC)
+	if (safi == SAFI_UNICAST || safi == SAFI_MULTICAST || safi == SAFI_LABELED_UNICAST ||
+	    safi == SAFI_FLOWSPEC || safi == SAFI_MUP)
 		return 1;
 	return 0;
 }
