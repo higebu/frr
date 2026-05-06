@@ -20,6 +20,8 @@
 
 PREDECL_LIST(zebra_announce);
 PREDECL_LIST(zebra_l2_vni);
+PREDECL_LIST(bgp_mup_pending_list);
+PREDECL_LIST(bgp_mup_origin_list);
 PREDECL_LIST(bgp_mup_isd_list);
 PREDECL_LIST(bgp_mup_dsd_list);
 
@@ -1086,6 +1088,18 @@ struct bgp {
 
 	/* BGP L3 service IPv4/v6 SRv6 backend */
 	struct srv6_policy srv6_unicast[AFI_MAX];
+
+	/* BGP-MUP origination: pending segment_interwork/direct waiting for
+	 * an SRv6 SID from zebra's SID manager.  See bgp_mup.c for the
+	 * struct (opaque here to avoid pulling bgp_mup.h into bgpd.h).
+	 */
+	struct bgp_mup_pending_list_head *mup_pending;
+
+	/* BGP-MUP origination: persistent record of `segment` commands
+	 * configured under address-family ipv4|ipv6 mup.  Survives SID
+	 * alloc/release cycles so we can re-emit the running config.
+	 */
+	struct bgp_mup_origin_list_head *mup_origins;
 
 	/* BGP-MUP discovery cache: received ISD/DSD routes used to resolve
 	 * incoming T1ST/T2ST routes (draft-ietf-bess-mup-safi Section 3.3.9 /

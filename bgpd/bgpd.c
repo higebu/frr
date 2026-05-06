@@ -4748,6 +4748,8 @@ void bgp_free(struct bgp *bgp)
 	bgp_scan_finish(bgp);
 	bgp_address_destroy(bgp);
 	bgp_tip_hash_destroy(bgp);
+	bgp_mup_origin_list_free(bgp);
+	bgp_mup_pending_list_free(bgp);
 	bgp_mup_caches_free(bgp);
 
 	/* release the auto RD id */
@@ -9367,6 +9369,7 @@ void bgp_init(unsigned short instance)
 
 	/* BGP VTY commands installation.  */
 	bgp_vty_init();
+	bgp_mup_vty_init();
 
 	/* BGP inits. */
 	bgp_attr_init();
