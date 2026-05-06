@@ -64,6 +64,7 @@
 #include "bgpd/bgp_evpn_mh.h"
 #include "bgpd/bgp_addpath.h"
 #include "bgpd/bgp_mac.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
@@ -20945,6 +20946,8 @@ static void bgp_vpn_policy_config_write_afi(struct vty *vty, struct bgp *bgp,
 			bgp->vpn_policy[afi]
 				.rmap_name[BGP_VPN_POLICY_DIR_TOVPN]);
 
+	bgp_mup_export_config_write(vty, bgp, afi, indent);
+
 	if (bgp->vpn_policy[afi].import_redirect_rtlist) {
 		char *b = ecommunity_ecom2str(
 					bgp->vpn_policy[afi]
@@ -21877,6 +21880,9 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 
 	if (safi == SAFI_MPLS_VPN)
 		bgp_vpn_config_write(vty, bgp, afi, safi);
+
+	if (safi == SAFI_MUP)
+		bgp_mup_config_write_af(vty, bgp, afi);
 
 	if (safi == SAFI_UNICAST) {
 		bgp_vpn_policy_config_write_afi(vty, bgp, afi);
