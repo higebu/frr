@@ -80,16 +80,26 @@ def is_string(value):
         return isinstance(value, str)
 
 
+_EXABGP_VERSION_CACHE = {}
+
+
 def get_exabgp_cmd(commander=None):
-    """Return the command to use for ExaBGP version >= 4.2.11"""
+    """Return the command to use for ExaBGP version >= 4.2.11.
+    Probes both the 4.x form (`exabgp --version`) and the 5.x form
+    (`exabgp version`); 5.x reorganised everything into subcommands
+    so `--version` no longer works."""
 
     if commander is None:
         commander = Commander("exabgp", logger=logging.getLogger("exabgp"))
 
     def exacmd_version_ok(exacmd):
         logger.debug("checking %s for exabgp version >= 4.2.11", exacmd)
-        _, stdout, _ = commander.cmd_status(exacmd + " --version", warn=False)
-        m = re.search(r"ExaBGP\s*:\s*((\d+)\.(\d+)(?:\.(\d+))?)", stdout)
+        m = None
+        for probe in (" --version", " version"):
+            _, stdout, _ = commander.cmd_status(exacmd + probe, warn=False)
+            m = re.search(r"ExaBGP\s*:\s*((\d+)\.(\d+)(?:\.(\d+))?)", stdout)
+            if m:
+                break
         if not m:
             return False
         version = m.group(1)
@@ -99,6 +109,7 @@ def get_exabgp_cmd(commander=None):
             )
             return False
         logger.info("Using ExaBGP version %s in %s", version, exacmd)
+        _EXABGP_VERSION_CACHE[exacmd] = version
         return True
 
     exacmd = commander.get_exec_path("exabgp")
@@ -1310,10 +1321,19 @@ class TopoExaBGP(TopoHost):
         self.run("chmod 644 /etc/exabgp/*")
         self.run("chmod a+x /etc/exabgp/*.py")
         self.run("chown -R exabgp:exabgp /etc/exabgp")
-        self.run("[ -p /var/run/exabgp.in ] || mkfifo /var/run/exabgp.in")
-        self.run("[ -p /var/run/exabgp.out ] || mkfifo /var/run/exabgp.out")
-        self.run("chown exabgp:exabgp /var/run/exabgp.{in,out}")
-        self.run("chmod 600 /var/run/exabgp.{in,out}")
+        # exabgp 5.x autodiscovers the API named pipe via stat() of
+        # several /run/* and /var/run/* locations and refuses to start
+        # if it finds a fifo it can't access — so pre-creating one
+        # (4.x-era convention) actively breaks 5.x.  Skip the
+        # mkfifo+chown dance on 5.x; the topotests don't drive routes
+        # through the exabgp API anyway.
+        version = _EXABGP_VERSION_CACHE.get(exacmd, "4.2.11")
+        is_5x = topotest.version_cmp(version, "5.0.0") >= 0
+        if not is_5x:
+            self.run("[ -p /var/run/exabgp.in ] || mkfifo /var/run/exabgp.in")
+            self.run("[ -p /var/run/exabgp.out ] || mkfifo /var/run/exabgp.out")
+            self.run("chown exabgp:exabgp /var/run/exabgp.{in,out}")
+            self.run("chmod 600 /var/run/exabgp.{in,out}")
 
         log_dir = os.path.join(self.logdir, self.name)
         self.run("chmod 777 {}".format(log_dir))
@@ -1323,9 +1343,29 @@ class TopoExaBGP(TopoHost):
         env_cmd = "env exabgp.log.level=INFO "
         env_cmd += "exabgp.log.destination={} ".format(log_file)
 
-        output = self.run(
-            env_cmd + exacmd + " -e /etc/exabgp/exabgp.env /etc/exabgp/exabgp.cfg "
-        )
+        # exabgp 5.x reshaped the CLI into subcommands; the 4.x
+        # `exabgp -e env config` form is gone.  Two 5.x quirks force
+        # the shape below:
+        #   - `--env-file` parses [exabgp.log] but NOT [exabgp.daemon]
+        #     (5.0.8 bug; daemonize/user/pid silently fall back to
+        #     defaults).  Use `EXABGP_ENVFILE=...` instead — that
+        #     reads the whole env file correctly.
+        #   - Even with daemonize=true, the grandchild's silence()
+        #     never fires under topotest's mutini/bash launch chain
+        #     (returns early; getppid()==1 race), so fd 1/2 stay
+        #     pointed at the bash stdout pipe and self.run() reads
+        #     from it forever.  Redirect stdio to /dev/null in the
+        #     shell so the pipe closes regardless.
+        if is_5x:
+            env_cmd += "EXABGP_ENVFILE=/etc/exabgp/exabgp.env "
+            invocation = (
+                exacmd
+                + " server /etc/exabgp/exabgp.cfg </dev/null >/dev/null 2>&1"
+            )
+        else:
+            invocation = exacmd + " -e /etc/exabgp/exabgp.env /etc/exabgp/exabgp.cfg "
+
+        output = self.run(env_cmd + invocation)
         if output is None or len(output) == 0:
             output = "<none>"
 
