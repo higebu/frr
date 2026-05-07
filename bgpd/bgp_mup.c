@@ -521,6 +521,14 @@ struct bgp_mup_origin {
 	bool has_explicit_sid;
 	struct in6_addr explicit_sid; /* iff has_explicit_sid */
 	char *rt_str;
+	/* Pre-parsed form of rt_str.  Allocated once at persist time so the
+	 * RT-match hot path (bgp_mup_any_vrf_imports / bgp_mup_match_install_vrf
+	 * legacy fallback) and the locator-arrival replay
+	 * (bgp_mup_replay_origin) avoid re-tokenising on every UPDATE.
+	 * rt_str is kept as the verbatim source for `show running-config`
+	 * and the `no segment ... rt RT` string match.
+	 */
+	struct ecommunity *rt_ecom;
 	char *mup_str; /* DSD only */
 	/* In-memory marker: this origin already has its SID assigned by
 	 * zebra (or via `sid explicit`) and the local install has been
@@ -1347,6 +1355,11 @@ static bool bgp_mup_build_st_delete(const struct mup_prefix *mp, struct zapi_rou
 	return false;
 }
 
+/* Forward decl: defined below near bgp_mup_match_install_vrf but used
+ * by bgp_mup_isd_announce/bgp_mup_dsd_announce above it.
+ */
+static bool bgp_mup_any_vrf_imports(afi_t afi, const struct attr *attr);
+
 /* Cache an ISD route into the discovery table.  Treat-as-withdraw on
  * any structural error (no Prefix-SID, malformed SID-Structure, etc).
  */
@@ -1362,6 +1375,11 @@ static void bgp_mup_isd_announce(struct bgp *bgp, afi_t afi, const struct mup_pr
 	if (!bgp_mup_get_sid_structure(attr, &sid, &block, &node, &func, &arg, &behavior)) {
 		if (BGP_DEBUG(zebra, ZEBRA))
 			zlog_debug("BGP-MUP: ISD without Prefix-SID; ignoring");
+		return;
+	}
+	if (!bgp_mup_any_vrf_imports(afi, attr)) {
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("BGP-MUP: ISD RT not imported by any vrf; skip cache");
 		return;
 	}
 	bgp_mup_prd_from_bytes(&prd, mp->rd);
@@ -1402,6 +1420,11 @@ static void bgp_mup_dsd_announce(struct bgp *bgp, afi_t afi, const struct mup_pr
 	if (!bgp_mup_get_sid_structure(attr, &sid, &block, &node, &func, &arg, &behavior)) {
 		if (BGP_DEBUG(zebra, ZEBRA))
 			zlog_debug("BGP-MUP: DSD without Prefix-SID; ignoring");
+		return;
+	}
+	if (!bgp_mup_any_vrf_imports(afi, attr)) {
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("BGP-MUP: DSD RT not imported by any vrf; skip cache");
 		return;
 	}
 	has_seg = bgp_mup_get_direct_seg_id(attr, &segment_id);
@@ -1631,25 +1654,62 @@ static bool bgp_mup_dsd_is_self(uint64_t segment_id)
 	return hash_lookup(bm->mup_self_dsd_hash, &tmp);
 }
 
-/* RT-based per-vrf install selection: walk every per-vrf bgp instance's
- * mup_origins and return the first one whose `segment` was originated
- * with an RT that matches one of the route's RT extended communities.
- * Returns VRF_UNKNOWN when no per-vrf instance imports this RT — the
- * caller skips the kernel install in that case.
+/* Forward decl: bgp_mup_afi_from_prefix is defined below near
+ * bgp_mup_zebra_install but used by bgp_mup_st_announce above it.
  */
-static vrf_id_t bgp_mup_match_install_vrf(const struct attr *attr)
+static afi_t bgp_mup_afi_from_prefix(const struct mup_prefix *mp);
+
+/* True iff any RT carried on `attr` appears in `bgp`'s per-afi
+ * MUP import RT list.  Mirrors L3VPN's vpn_leak_to_vrf_update_onevrf
+ * (bgp_mplsvpn.c) `ecommunity_include` test against
+ * vpn_policy[afi].rtlist[FROMVPN].
+ */
+static bool bgp_mup_route_rt_in_import(struct bgp *bgp, afi_t afi,
+				       struct ecommunity *route_rt)
+{
+	if (!bgp->mup_import_rtlist[afi])
+		return false;
+	return ecommunity_include(bgp->mup_import_rtlist[afi], route_rt);
+}
+
+/* True iff at least one per-vrf bgp instance imports the RT carried on
+ * `attr`.  Used to gate ISD/DSD cache upsert: a transit PE shouldn't
+ * cache discovery state for slices it has no policy to serve, since a
+ * stale ISD could otherwise wrongly cover a T1ST for a slice the local
+ * PE has no business resolving.
+ *
+ * As with bgp_mup_match_install_vrf, when *no* per-vrf instance has an
+ * explicit `route-target import` list configured we fall back to
+ * matching against `mup_origins` export RTs to preserve the symmetric
+ * PE harness behaviour.  An explicit empty import list ("nothing
+ * matches") is honoured.
+ */
+static bool bgp_mup_any_vrf_imports(afi_t afi, const struct attr *attr)
 {
 	struct ecommunity *route_rt;
 	struct listnode *node;
 	struct bgp *bgp;
-	vrf_id_t found = VRF_UNKNOWN;
+	bool any_explicit_import = false;
 
 	if (!attr)
-		return VRF_UNKNOWN;
+		return false;
 	route_rt = bgp_attr_get_ecommunity(attr);
 	if (!route_rt)
-		return VRF_UNKNOWN;
+		return false;
 
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
+		if (bgp->vrf_id == VRF_DEFAULT || bgp->vrf_id == VRF_UNKNOWN)
+			continue;
+		if (bgp->mup_import_rtlist[afi])
+			any_explicit_import = true;
+		if (bgp_mup_route_rt_in_import(bgp, afi, route_rt))
+			return true;
+	}
+
+	if (any_explicit_import)
+		return false;
+
+	/* Legacy fallback: match against any `segment ... rt RT` origin. */
 	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
 		struct bgp_mup_origin *o;
 
@@ -1658,28 +1718,84 @@ static vrf_id_t bgp_mup_match_install_vrf(const struct attr *attr)
 		if (!bgp->mup_origins)
 			continue;
 		frr_each (bgp_mup_origin_list, bgp->mup_origins, o) {
-			struct ecommunity *o_rt;
-
-			if (!o->rt_str)
+			if (!o->rt_ecom)
 				continue;
-			o_rt = ecommunity_str2com(o->rt_str, ECOMMUNITY_ROUTE_TARGET, 0);
-			if (!o_rt)
-				continue;
-			if (ecommunity_match(route_rt, o_rt)) {
-				ecommunity_free(&o_rt);
-				return bgp->vrf_id;
-			}
-			ecommunity_free(&o_rt);
+			if (ecommunity_match(route_rt, o->rt_ecom))
+				return true;
 		}
 	}
-	return found;
+	return false;
+}
+
+/* RT-based per-vrf install selection: walk every per-vrf bgp instance
+ * and return the first one whose configured `route-target import` list
+ * contains an RT that matches one of the route's RT extended
+ * communities.  Returns VRF_UNKNOWN when no per-vrf instance imports
+ * this RT — the caller skips the kernel install in that case.
+ *
+ * As a backwards-compat fallback, an instance whose import list is
+ * unset is matched against its `mup_origins` export RTs (the legacy
+ * symmetric-PE behaviour); this only kicks in when no instance has an
+ * explicit import list, so an explicit empty import list ("nothing
+ * matches") is honoured.  The L3VPN reference path
+ * (vpn_leak_to_vrf_update_onevrf) is import-only — the fallback is
+ * a strict superset for one cycle to keep existing operator configs
+ * (e.g. srv6-mup-tests/scripts/frr_only_segment.sh) working without
+ * a flag day.
+ */
+static vrf_id_t bgp_mup_match_install_vrf(afi_t afi, const struct attr *attr)
+{
+	struct ecommunity *route_rt;
+	struct listnode *node;
+	struct bgp *bgp;
+	bool any_explicit_import = false;
+
+	if (!attr)
+		return VRF_UNKNOWN;
+	route_rt = bgp_attr_get_ecommunity(attr);
+	if (!route_rt)
+		return VRF_UNKNOWN;
+
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
+		if (bgp->vrf_id == VRF_DEFAULT || bgp->vrf_id == VRF_UNKNOWN)
+			continue;
+		if (bgp->mup_import_rtlist[afi])
+			any_explicit_import = true;
+		if (bgp_mup_route_rt_in_import(bgp, afi, route_rt))
+			return bgp->vrf_id;
+	}
+
+	if (any_explicit_import)
+		return VRF_UNKNOWN;
+
+	/* Legacy fallback: no instance has an explicit import list.
+	 * Match against `segment ... rt RT` (origin export) — preserves
+	 * the symmetric PE harness behaviour from before the import-RT
+	 * CLI existed.
+	 */
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
+		struct bgp_mup_origin *o;
+
+		if (bgp->vrf_id == VRF_DEFAULT || bgp->vrf_id == VRF_UNKNOWN)
+			continue;
+		if (!bgp->mup_origins)
+			continue;
+		frr_each (bgp_mup_origin_list, bgp->mup_origins, o) {
+			if (!o->rt_ecom)
+				continue;
+			if (ecommunity_match(route_rt, o->rt_ecom))
+				return bgp->vrf_id;
+		}
+	}
+	return VRF_UNKNOWN;
 }
 
 static int bgp_mup_st_announce(struct bgp_dest *dest, struct bgp_path_info *info, struct bgp *bgp,
 			       const struct prefix_mup *pm, const struct mup_prefix *mp)
 {
 	struct zapi_route api = {};
-	vrf_id_t install_vrf_id = bgp_mup_match_install_vrf(info->attr);
+	afi_t afi = bgp_mup_afi_from_prefix(mp);
+	vrf_id_t install_vrf_id = bgp_mup_match_install_vrf(afi, info->attr);
 
 	(void)dest;
 
@@ -1773,10 +1889,22 @@ static void bgp_mup_st_delete_send(struct bgp *bgp, struct bgp_path_info *info,
 				   const struct mup_prefix *mp)
 {
 	struct zapi_route api = {};
+	vrf_id_t install_vrf_id;
+	afi_t afi = bgp_mup_afi_from_prefix(mp);
 
 	bgp_mup_zapi_init(&api, bgp, info, false);
 	if (!bgp_mup_build_st_delete(mp, &api))
 		return;
+	/* The install was sent to the per-vrf table that imports the
+	 * route's RT — the withdraw must target the same table.  Falling
+	 * back to bgp->vrf_id (== default) here would leave a stale
+	 * install in slice1's table when the matching ISD/DSD is
+	 * removed.  Mirrors L3VPN's vpn_leak_to_vrf_withdraw which
+	 * walks each import-matching vrf to issue the withdraw.
+	 */
+	install_vrf_id = bgp_mup_match_install_vrf(afi, info ? info->attr : NULL);
+	if (install_vrf_id != VRF_UNKNOWN)
+		api.vrf_id = install_vrf_id;
 	zclient_route_send(ZEBRA_ROUTE_DELETE, bgp_zclient, &api);
 }
 
@@ -2296,6 +2424,8 @@ static struct bgp_mup_origin *bgp_mup_origin_find(struct bgp *bgp, uint16_t rout
 static void bgp_mup_origin_free(struct bgp_mup_origin *o)
 {
 	XFREE(MTYPE_BGP_MUP_STR, o->rt_str);
+	if (o->rt_ecom)
+		ecommunity_free(&o->rt_ecom);
 	XFREE(MTYPE_BGP_MUP_STR, o->mup_str);
 	XFREE(MTYPE_BGP_MUP_ORIGIN, o);
 }
@@ -2369,16 +2499,25 @@ static void bgp_mup_origin_clear_installed(struct bgp *bgp, uint16_t route_type,
 static void bgp_mup_origin_persist_isd(struct bgp *bgp, const struct bgp_mup_origin_args *args,
 				       const char *rt_str)
 {
-	struct bgp_mup_origin *o = bgp_mup_origin_find(bgp, BGP_MUP_ISD_ROUTE, args->afi,
-						       &args->prd, &args->isd_prefix, NULL);
+	struct bgp_mup_origin *o;
+	struct ecommunity *rt_ecom;
 	bool sid_ready = false;
 	struct in6_addr last_sid = {};
 	enum seg6local_action_t last_act = ZEBRA_SEG6_LOCAL_ACTION_UNSPEC;
 
+	rt_ecom = ecommunity_str2com(rt_str, ECOMMUNITY_ROUTE_TARGET, 0);
+	if (!rt_ecom)
+		return;
+
+	o = bgp_mup_origin_find(bgp, BGP_MUP_ISD_ROUTE, args->afi, &args->prd, &args->isd_prefix,
+				NULL);
 	if (o) {
 		/* Carry over the install fingerprint so explicit-SID's
 		 * synchronous emit (which ran before persist) survives the
-		 * record replacement and a later replay can dedup.
+		 * record replacement and a later replay can dedup.  rt_ecom
+		 * is intentionally not carried over — the operator may have
+		 * changed the RT on a re-issued `segment` line, and the old
+		 * rt_ecom is freed by bgp_mup_origin_free below.
 		 */
 		sid_ready = o->sid_ready;
 		last_sid = o->last_installed_sid;
@@ -2394,6 +2533,7 @@ static void bgp_mup_origin_persist_isd(struct bgp *bgp, const struct bgp_mup_ori
 	o->has_explicit_sid = args->has_explicit_sid;
 	o->explicit_sid = args->explicit_sid;
 	o->rt_str = XSTRDUP(MTYPE_BGP_MUP_STR, rt_str);
+	o->rt_ecom = rt_ecom;
 	o->sid_ready = sid_ready;
 	o->last_installed_sid = last_sid;
 	o->last_installed_act = last_act;
@@ -2404,19 +2544,27 @@ static void bgp_mup_origin_persist_isd(struct bgp *bgp, const struct bgp_mup_ori
 static void bgp_mup_origin_persist_dsd(struct bgp *bgp, const struct bgp_mup_origin_args *args,
 				       const char *rt_str, const char *mup_str)
 {
-	struct bgp_mup_origin *o = bgp_mup_origin_find(bgp, BGP_MUP_DSD_ROUTE, args->afi,
-						       &args->prd, NULL, &args->dsd_endpoint);
+	struct bgp_mup_origin *o;
+	struct ecommunity *rt_ecom;
 	uint64_t segment_id;
 	bool sid_ready = false;
 	struct in6_addr last_sid = {};
 	enum seg6local_action_t last_act = ZEBRA_SEG6_LOCAL_ACTION_UNSPEC;
 
+	rt_ecom = ecommunity_str2com(rt_str, ECOMMUNITY_ROUTE_TARGET, 0);
+	if (!rt_ecom)
+		return;
+
+	o = bgp_mup_origin_find(bgp, BGP_MUP_DSD_ROUTE, args->afi, &args->prd, NULL,
+				&args->dsd_endpoint);
 	if (o) {
 		if (bgp_mup_origin_segment_id(o, &segment_id))
 			bgp_mup_self_dsd_index_del(segment_id);
 		/* Carry over the install fingerprint so explicit-SID's
 		 * synchronous emit (which ran before persist) survives
 		 * the record replacement and a later replay can dedup.
+		 * rt_ecom is freshly parsed from the new rt_str above; the
+		 * old rt_ecom is freed by bgp_mup_origin_free below.
 		 */
 		sid_ready = o->sid_ready;
 		last_sid = o->last_installed_sid;
@@ -2433,6 +2581,7 @@ static void bgp_mup_origin_persist_dsd(struct bgp *bgp, const struct bgp_mup_ori
 	o->has_explicit_sid = args->has_explicit_sid;
 	o->explicit_sid = args->explicit_sid;
 	o->rt_str = XSTRDUP(MTYPE_BGP_MUP_STR, rt_str);
+	o->rt_ecom = rt_ecom;
 	o->mup_str = XSTRDUP(MTYPE_BGP_MUP_STR, mup_str);
 	o->sid_ready = sid_ready;
 	o->last_installed_sid = last_sid;
@@ -3177,6 +3326,15 @@ void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi)
 	struct bgp_mup_origin *o;
 	char rd_buf[RD_ADDRSTRLEN];
 
+	if (bgp->mup_import_rtlist[afi]) {
+		char *b = ecommunity_ecom2str(bgp->mup_import_rtlist[afi],
+					      ECOMMUNITY_FORMAT_ROUTE_MAP,
+					      ECOMMUNITY_ROUTE_TARGET);
+
+		vty_out(vty, "  route-target import %s\n", b);
+		XFREE(MTYPE_ECOMMUNITY_STR, b);
+	}
+
 	if (!bgp->mup_origins)
 		return;
 
@@ -3226,9 +3384,9 @@ static void bgp_mup_replay_origin(struct bgp *bgp, struct bgp_mup_origin *o)
 	args.has_explicit_sid = o->has_explicit_sid;
 	args.explicit_sid = o->explicit_sid;
 
-	rt = ecommunity_str2com(o->rt_str, ECOMMUNITY_ROUTE_TARGET, 0);
-	if (!rt)
+	if (!o->rt_ecom)
 		return;
+	rt = ecommunity_dup(o->rt_ecom);
 
 	if (o->route_type == BGP_MUP_ISD_ROUTE) {
 		args.isd_prefix = o->isd_prefix;
@@ -3351,10 +3509,113 @@ invalidate:
 		bgp_mup_schedule_reannounce_st_routes(bgp, AFI_IP6);
 }
 
+/* `route-target import RTLIST` under `address-family ipv[46] mup` —
+ * BGP-MUP analogue of L3VPN's `route-target vpn import RTLIST`
+ * (af_rt_vpn_imexport_cmd in bgp_vty.c).  Stored on the per-vrf bgp
+ * instance and consulted by bgp_mup_match_install_vrf and the
+ * ISD/DSD cache upsert paths.  Pure receive-only PEs (e.g. a MUP-PE
+ * that never originates ISD/DSD, only receives T1ST/T2ST from a
+ * MUP-Controller) need this to declare which RTs map into the local
+ * vrf table — the previous implementation conflated import with the
+ * `segment` line's export RT and broke this case.  Mirrors L3VPN
+ * structurally per memory/feedback_bgp_mup_l3vpn_reference.md.
+ */
+DEFPY(bgp_mup_route_target_import,
+      bgp_mup_route_target_import_cmd,
+      "[no] <rt|route-target> import RTLIST...",
+      NO_STR
+      "Specify route target list\n"
+      "Specify route target list\n"
+      "For BGP-MUP routes received in the default-vrf MUP RIB and imported into this vrf\n"
+      "Space separated route target list (A.B.C.D:MN|EF:OPQR|GHJK:MN)\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct ecommunity *ecom = NULL;
+	afi_t afi;
+	int idx = 0;
+	bool yes = true;
+	int i;
+
+	if (argv_find(argv, argc, "no", &idx))
+		yes = false;
+
+	if (vty->node == BGP_IPV4_MUP_NODE)
+		afi = AFI_IP;
+	else if (vty->node == BGP_IPV6_MUP_NODE)
+		afi = AFI_IP6;
+	else {
+		vty_out(vty,
+			"%% context error: only valid in `address-family ipv[46] mup`\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	if (bgp->vrf_id == VRF_DEFAULT) {
+		vty_out(vty,
+			"%% route-target import must be configured under a non-default vrf bgp instance (`router bgp ASN vrf NAME`); the default-vrf instance only carries the BGP-MUP session\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	if (yes) {
+		if (!argv_find(argv, argc, "RTLIST", &idx)) {
+			vty_out(vty, "%% Missing RTLIST\n");
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+		for (i = idx; i < argc; ++i) {
+			struct ecommunity *e = ecommunity_str2com(
+				argv[i]->arg, ECOMMUNITY_ROUTE_TARGET, 0);
+
+			if (!e) {
+				vty_out(vty, "%% Malformed RT '%s'\n",
+					argv[i]->arg);
+				if (ecom)
+					ecommunity_free(&ecom);
+				return CMD_WARNING_CONFIG_FAILED;
+			}
+			if (ecom) {
+				ecommunity_merge(ecom, e);
+				ecommunity_free(&e);
+			} else {
+				ecom = e;
+			}
+		}
+	}
+
+	if (bgp->mup_import_rtlist[afi])
+		ecommunity_free(&bgp->mup_import_rtlist[afi]);
+	bgp->mup_import_rtlist[afi] = ecom; /* may be NULL on `no` */
+
+	/* T1ST/T2ST already in the default-vrf MUP RIB may now resolve to
+	 * (or away from) this vrf.  Schedule a coalesced reannounce on
+	 * every bgp instance that holds an MUP RIB so post-config
+	 * resolution catches up without bouncing the session.
+	 */
+	{
+		struct listnode *node;
+		struct bgp *b;
+
+		for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, b))
+			bgp_mup_schedule_reannounce_st_routes(b, afi);
+	}
+
+	return CMD_SUCCESS;
+}
+
+ALIAS(bgp_mup_route_target_import,
+      bgp_mup_no_route_target_import_cmd,
+      "no <rt|route-target> import",
+      NO_STR
+      "Specify route target list\n"
+      "Specify route target list\n"
+      "For BGP-MUP routes received in the default-vrf MUP RIB and imported into this vrf\n")
+
 void bgp_mup_vty_init(void)
 {
 	install_element(BGP_IPV4_MUP_NODE, &bgp_mup_segment_interwork_cmd);
 	install_element(BGP_IPV4_MUP_NODE, &bgp_mup_segment_direct_cmd);
+	install_element(BGP_IPV4_MUP_NODE, &bgp_mup_route_target_import_cmd);
+	install_element(BGP_IPV4_MUP_NODE, &bgp_mup_no_route_target_import_cmd);
 	install_element(BGP_IPV6_MUP_NODE, &bgp_mup_segment_interwork_cmd);
 	install_element(BGP_IPV6_MUP_NODE, &bgp_mup_segment_direct_cmd);
+	install_element(BGP_IPV6_MUP_NODE, &bgp_mup_route_target_import_cmd);
+	install_element(BGP_IPV6_MUP_NODE, &bgp_mup_no_route_target_import_cmd);
 }
