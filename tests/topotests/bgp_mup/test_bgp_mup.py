@@ -82,6 +82,13 @@ def build_topo(tgen):
     tgen.gears["r1"].run("ip link add slice1 type vrf table 100")
     tgen.gears["r1"].run("ip link set slice1 up")
 
+    # r2 is the receive-only PE: it never originates ISD/DSD, but it
+    # still needs a per-vrf bgp instance to declare a `route-target
+    # import` for the T1ST/T2ST received from peer1.  bgpd refuses
+    # `router bgp ASN vrf slice1` if the netdev doesn't exist.
+    tgen.gears["r2"].run("ip link add slice1 type vrf table 100")
+    tgen.gears["r2"].run("ip link set slice1 up")
+
 
 def setup_module(mod):
     tgen = Topogen(build_topo, mod.__name__)
@@ -177,7 +184,9 @@ def _grep(router, command, pattern):
 
 
 def test_isd_dsd_originated_on_r1():
-    """r1 must have its ISD(v4)+DSD(v4)+ISD(v6) routes in the local RIB."""
+    """r1 must have its ISD(v4)+two DSD(v4) (one per RT)+ISD(v6) routes
+    in the local RIB.  The second DSD (RT 65001:2) drives the
+    multi-RT import-filter test on r2."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -187,7 +196,8 @@ def test_isd_dsd_originated_on_r1():
 
     expectations = [
         ("show bgp ipv4 mup all", "10.99.0.0/24", "ISD(v4)"),
-        ("show bgp ipv4 mup all", "10.0.0.250", "DSD(v4)"),
+        ("show bgp ipv4 mup all", "10.0.0.250", "DSD(v4) RT 65001:1"),
+        ("show bgp ipv4 mup all", "10.0.0.251", "DSD(v4) RT 65001:2"),
         ("show bgp ipv6 mup all", "2001:db8:99::/64", "ISD(v6)"),
     ]
     for cmd, pat, label in expectations:
@@ -201,7 +211,7 @@ def test_isd_dsd_originated_on_r1():
 
 
 def test_isd_dsd_propagated_to_r2():
-    """The same three routes must arrive at r2 over BGP-MUP."""
+    """All four originated routes must arrive at r2 over BGP-MUP."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -211,7 +221,8 @@ def test_isd_dsd_propagated_to_r2():
 
     expectations = [
         ("show bgp ipv4 mup all", "10.99.0.0/24", "ISD(v4)"),
-        ("show bgp ipv4 mup all", "10.0.0.250", "DSD(v4)"),
+        ("show bgp ipv4 mup all", "10.0.0.250", "DSD(v4) RT 65001:1"),
+        ("show bgp ipv4 mup all", "10.0.0.251", "DSD(v4) RT 65001:2"),
         ("show bgp ipv6 mup all", "2001:db8:99::/64", "ISD(v6)"),
     ]
     for cmd, pat, label in expectations:
@@ -225,8 +236,14 @@ def test_isd_dsd_propagated_to_r2():
 
 
 def test_prefix_sid_structure_propagated():
-    """RFC 9252 §3.1 SID Structure sub-sub-TLV (block 40 / node 24 /
-    func 16 / arg 0) must round-trip from r1's locator config to r2."""
+    """RFC 9252 §3.1 SID Structure sub-sub-TLV (block 24 / node 24 /
+    func 8 / arg 0) must round-trip from r1's locator config to r2.
+
+    Layout chosen so loc_func (= 56) leaves room for both the IPv4 DA
+    (32 bits at offset 56) and Args.Mob.Session (40 bits at offset 88)
+    when r2 synthesizes End.M.GTP4.E SIDs per RFC 9433 §6.6: a larger
+    locator (e.g. /64 with block 40+node 24+func 16) overflows IPV6_MAX
+    once those mobile-args are layered on."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -236,7 +253,7 @@ def test_prefix_sid_structure_propagated():
         r2,
         lambda r: None
         if _grep(r, "show bgp ipv4 mup all detail-routes",
-                 "sid structure=[40 24 16 0 0 0]")
+                 "sid structure=[24 24 8 0 0 0]")
         else "SID Structure sub-sub-TLV not seen on r2",
         "Prefix-SID Structure",
     )
@@ -298,10 +315,13 @@ def test_t2st_received_from_peer1():
         )
 
 
-def _route_via_bgp(router, prefix, family="ip"):
-    """Return True iff `show <family> route <prefix> json` reports a
-    BGP-installed route on `router`."""
-    cmd = "show {} route {} json".format(family, prefix)
+def _route_via_bgp(router, prefix, family="ip", vrf=None):
+    """Return True iff `show <family> route [vrf VRF] <prefix> json`
+    reports a BGP-installed route on `router`."""
+    if vrf:
+        cmd = "show {} route vrf {} {} json".format(family, vrf, prefix)
+    else:
+        cmd = "show {} route {} json".format(family, prefix)
     output = router.vtysh_cmd(cmd, isjson=True)
     if not isinstance(output, dict):
         return False
@@ -320,9 +340,12 @@ def _route_via_bgp(router, prefix, family="ip"):
 
 
 def test_t1st_resolved_via_isd_cache():
-    """r2 must install an SRv6 H.Encaps route for 192.168.1.5/32 once
-    r1's ISD 10.99.0.0/24 covers the T1ST endpoint 10.99.0.5
-    (draft §3.3.9 + RFC 9433 §6.6).  Resolution is order-independent:
+    """r2 must install an SRv6 H.Encaps route for 192.168.1.5/32 in
+    vrf slice1 once r1's ISD 10.99.0.0/24 covers the T1ST endpoint
+    10.99.0.5 (draft §3.3.9 + RFC 9433 §6.6).  r2 is a pure
+    receive-only PE — it has no `segment` line, only a
+    `route-target import 65001:1` under `address-family ipv4 mup` of
+    the slice1 vrf instance.  Resolution is order-independent:
     bgp_mup_isd_cache_upsert() retries any T1ST already in the RIB."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
@@ -332,15 +355,16 @@ def test_t1st_resolved_via_isd_cache():
     _wait_for(
         r2,
         lambda r: None
-        if _route_via_bgp(r, "192.168.1.5/32")
-        else "BGP route for 192.168.1.5/32 not installed",
+        if _route_via_bgp(r, "192.168.1.5/32", vrf="slice1")
+        else "BGP route for 192.168.1.5/32 not installed in vrf slice1",
         "T1ST UE 192.168.1.5/32 resolved",
     )
 
 
 def test_t1st_skipped_without_isd():
     """T1ST 192.168.2.5/32 has endpoint 10.123.0.5 with no covering ISD;
-    r2 must NOT install a FIB route for it."""
+    r2 must NOT install a FIB route for it (in either default vrf or
+    vrf slice1)."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -352,11 +376,15 @@ def test_t1st_skipped_without_isd():
     assert not _route_via_bgp(r2, "192.168.2.5/32"), (
         "T1ST without a covering ISD must not install a route"
     )
+    assert not _route_via_bgp(r2, "192.168.2.5/32", vrf="slice1"), (
+        "T1ST without a covering ISD must not install a route in slice1"
+    )
 
 
 def test_t2st_resolved_via_dsd_cache():
     """r2 must install an H.M.GTP4.D seg6local route for 10.0.0.250/32
-    once r1's DSD with MUP-EC 65001:10 is in the cache (draft §3.3.12)."""
+    in vrf slice1 once r1's DSD with MUP-EC 65001:10 is in the cache
+    (draft §3.3.12)."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -365,15 +393,16 @@ def test_t2st_resolved_via_dsd_cache():
     _wait_for(
         r2,
         lambda r: None
-        if _route_via_bgp(r, "10.0.0.250/32")
-        else "BGP route for 10.0.0.250/32 not installed",
+        if _route_via_bgp(r, "10.0.0.250/32", vrf="slice1")
+        else "BGP route for 10.0.0.250/32 not installed in vrf slice1",
         "T2ST 10.0.0.250/32 resolved",
     )
 
 
 def test_t2st_skipped_without_dsd():
     """T2ST 10.0.0.99 carries MUP-EC 65001:99 with no matching DSD;
-    r2 must NOT install a FIB route for it."""
+    r2 must NOT install a FIB route for it (in either default vrf or
+    vrf slice1)."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -382,6 +411,49 @@ def test_t2st_skipped_without_dsd():
     time.sleep(5)
     assert not _route_via_bgp(r2, "10.0.0.99/32"), (
         "T2ST without a matching DSD must not install a route"
+    )
+    assert not _route_via_bgp(r2, "10.0.0.99/32", vrf="slice1"), (
+        "T2ST without a matching DSD must not install a route in slice1"
+    )
+
+
+def test_t2st_filtered_by_import_rt():
+    """T2ST 10.0.0.251 carries RT 65001:2 (and matches r1's second
+    DSD with mup 65001:11), so resolution against the DSD cache
+    succeeds — but r2's slice1 vrf imports only RT 65001:1, so the
+    install-vrf selection must return VRF_UNKNOWN and no FIB entry
+    should appear in slice1.
+
+    This is the negative side of the per-vrf import-RT filter:
+    confirms that an explicitly-set import list rejects routes whose
+    RTs are not in it, even when DSD/T1ST resolution itself would
+    otherwise succeed.  Mirrors L3VPN's
+    vpn_leak_to_vrf_update_onevrf RT-mismatch path."""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r2 = tgen.gears["r2"]
+
+    # Confirm the T2ST is selectable in r2's default-vrf MUP RIB —
+    # filter rejection happens at the install-vrf step, not at the
+    # BGP RIB level.
+    _wait_for(
+        r2,
+        lambda r: None
+        if _grep(r, "show bgp ipv4 mup all", "10.0.0.251")
+        else "expected T2ST 10.0.0.251 in r2's MUP RIB",
+        "T2ST 10.0.0.251 selectable in MUP RIB",
+    )
+
+    # Allow the resolution + install-vrf path to run.
+    time.sleep(5)
+    assert not _route_via_bgp(r2, "10.0.0.251/32", vrf="slice1"), (
+        "T2ST RT 65001:2 must not install in slice1 (slice1 only "
+        "imports 65001:1)"
+    )
+    assert not _route_via_bgp(r2, "10.0.0.251/32"), (
+        "T2ST RT 65001:2 must not install in default vrf either"
     )
 
 
@@ -398,37 +470,42 @@ def test_no_segment_removes_route():
 
     r1.vtysh_cmd(
         "configure terminal\n"
-        "router bgp 65001\n"
+        "router bgp 65001 vrf slice1\n"
         " address-family ipv4 mup\n"
-        "  no segment direct 10.0.0.250 rd 100:100 rt 65001:1 mup 65001:10 behavior End_DT4\n"
+        "  no segment direct 10.0.0.250 rd 100:100 rt 65001:1 mup 65001:10 behavior dt4\n"
         " exit-address-family\n"
         "exit\n"
     )
 
+    # Match the DSD NLRI form `[2]:[12]:[10.0.0.250]` specifically — the
+    # T2ST received from peer1 also contains "10.0.0.250" in its NLRI
+    # (route_type 4: `[4]:[17]:[64/10.0.0.250]`), so a bare substring
+    # match would still hit even after the DSD is gone.
+    dsd_nlri = "[2]:[12]:[10.0.0.250]"
     _wait_for(
         r1,
         lambda r: None
-        if not _grep(r, "show bgp ipv4 mup all", "10.0.0.250")
+        if not _grep(r, "show bgp ipv4 mup all", dsd_nlri)
         else "DSD still present on r1",
         "DSD withdrawn from r1",
     )
     _wait_for(
         r2,
         lambda r: None
-        if not _grep(r, "show bgp ipv4 mup all", "10.0.0.250")
+        if not _grep(r, "show bgp ipv4 mup all", dsd_nlri)
         else "DSD still present on r2",
         "DSD withdrawn from r2",
     )
     _wait_for(
         r2,
         lambda r: None
-        if not _route_via_bgp(r, "10.0.0.250/32")
+        if not _route_via_bgp(r, "10.0.0.250/32", vrf="slice1")
         else "T2ST FIB entry still present on r2 after DSD withdrawal",
         "T2ST 10.0.0.250/32 withdrawn from r2 FIB",
     )
 
     output = r1.vtysh_cmd("show running-config")
-    assert "10.0.0.250" not in output, (
+    assert "segment direct 10.0.0.250" not in output, (
         "running-config still contains the withdrawn DSD line"
     )
 
