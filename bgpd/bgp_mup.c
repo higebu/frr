@@ -11,6 +11,8 @@
 #include "linklist.h"
 #include "prefix.h"
 #include "stream.h"
+#include "table.h"
+#include "typesafe.h"
 
 #include "bgpd/bgpd.h"
 #include "bgpd/bgp_attr.h"
@@ -474,8 +476,11 @@ static int bgp_mup_process_t2st_route(struct peer *peer, afi_t afi, safi_t safi,
  * arrival order, we cache each accepted ISD/DSD in per-bgp lists.
  */
 
+PREDECL_DLIST(bgp_mup_isd_lpm_chain);
+
 struct bgp_mup_isd_entry {
-	struct bgp_mup_isd_list_item item;
+	struct bgp_mup_isd_hash_item hash_item;
+	struct bgp_mup_isd_lpm_chain_item lpm_item;
 	afi_t afi;
 	struct prefix_rd prd;
 	struct prefix prefix; /* Endpoint prefix from ISD NLRI */
@@ -486,10 +491,38 @@ struct bgp_mup_isd_entry {
 	uint8_t arg_len;
 	uint16_t behavior; /* End.M.GTP4.E or End.M.GTP6.E */
 };
-DECLARE_LIST(bgp_mup_isd_list, struct bgp_mup_isd_entry, item);
+
+static int bgp_mup_isd_hash_cmp(const struct bgp_mup_isd_entry *a,
+				const struct bgp_mup_isd_entry *b)
+{
+	int r;
+
+	if (a->afi != b->afi)
+		return (a->afi < b->afi) ? -1 : 1;
+	r = memcmp(a->prd.val, b->prd.val, sizeof(a->prd.val));
+	if (r != 0)
+		return r;
+	if (prefix_same(&a->prefix, &b->prefix))
+		return 0;
+	return memcmp(&a->prefix, &b->prefix, sizeof(a->prefix));
+}
+
+static uint32_t bgp_mup_isd_hash_hash(const struct bgp_mup_isd_entry *e)
+{
+	uint32_t h = jhash_1word(e->afi, 0xb6709a6c);
+
+	h = jhash(e->prd.val, sizeof(e->prd.val), h);
+	return jhash(&e->prefix, sizeof(e->prefix), h);
+}
+
+DECLARE_HASH(bgp_mup_isd_hash, struct bgp_mup_isd_entry, hash_item,
+	     bgp_mup_isd_hash_cmp, bgp_mup_isd_hash_hash);
+DECLARE_DLIST(bgp_mup_isd_lpm_chain, struct bgp_mup_isd_entry, lpm_item);
 
 struct bgp_mup_dsd_entry {
-	struct bgp_mup_dsd_list_item item;
+	struct bgp_mup_dsd_hash_item hash_item;
+	struct bgp_mup_dsd_segid_hash_item segid_item;
+	bool segid_linked; /* in mup_dsd_segid_hash iff true */
 	afi_t afi;
 	struct prefix_rd prd;
 	struct ipaddr endpoint; /* Originating PE address (DSD NLRI) */
@@ -502,7 +535,49 @@ struct bgp_mup_dsd_entry {
 	bool has_segment_id;
 	uint64_t segment_id; /* MUP-EC Direct-Type Segment Identifier (48 bits) */
 };
-DECLARE_LIST(bgp_mup_dsd_list, struct bgp_mup_dsd_entry, item);
+
+static int bgp_mup_dsd_hash_cmp(const struct bgp_mup_dsd_entry *a,
+				const struct bgp_mup_dsd_entry *b)
+{
+	int r;
+
+	if (a->afi != b->afi)
+		return (a->afi < b->afi) ? -1 : 1;
+	r = memcmp(a->prd.val, b->prd.val, sizeof(a->prd.val));
+	if (r != 0)
+		return r;
+	if (ipaddr_is_same(&a->endpoint, &b->endpoint))
+		return 0;
+	return memcmp(&a->endpoint, &b->endpoint, sizeof(a->endpoint));
+}
+
+static uint32_t bgp_mup_dsd_hash_hash(const struct bgp_mup_dsd_entry *e)
+{
+	uint32_t h = jhash_1word(e->afi, 0xc0a5d5d5);
+
+	h = jhash(e->prd.val, sizeof(e->prd.val), h);
+	return jhash(&e->endpoint, sizeof(e->endpoint), h);
+}
+
+DECLARE_HASH(bgp_mup_dsd_hash, struct bgp_mup_dsd_entry, hash_item,
+	     bgp_mup_dsd_hash_cmp, bgp_mup_dsd_hash_hash);
+
+static int bgp_mup_dsd_segid_hash_cmp(const struct bgp_mup_dsd_entry *a,
+				      const struct bgp_mup_dsd_entry *b)
+{
+	if (a->segment_id == b->segment_id)
+		return 0;
+	return (a->segment_id < b->segment_id) ? -1 : 1;
+}
+
+static uint32_t bgp_mup_dsd_segid_hash_hash(const struct bgp_mup_dsd_entry *e)
+{
+	return jhash_2words((uint32_t)(e->segment_id >> 32),
+			    (uint32_t)e->segment_id, 0xd5d5dead);
+}
+
+DECLARE_HASH(bgp_mup_dsd_segid_hash, struct bgp_mup_dsd_entry, segid_item,
+	     bgp_mup_dsd_segid_hash_cmp, bgp_mup_dsd_segid_hash_hash);
 
 /* Persistent record of one operator-configured `segment` line.  Lives on
  * the per-vrf bgp instance under whose `address-family ipv[46] mup`
@@ -551,22 +626,41 @@ struct bgp_mup_origin {
 };
 DECLARE_LIST(bgp_mup_origin_list, struct bgp_mup_origin, item);
 
-static struct bgp_mup_isd_list_head *bgp_mup_get_isd_cache(struct bgp *bgp)
+static struct bgp_mup_isd_hash_head *bgp_mup_get_isd_hash(struct bgp *bgp)
 {
-	if (!bgp->mup_isd_cache) {
-		bgp->mup_isd_cache = XCALLOC(MTYPE_BGP_MUP_LIST, sizeof(*bgp->mup_isd_cache));
-		bgp_mup_isd_list_init(bgp->mup_isd_cache);
+	if (!bgp->mup_isd_hash) {
+		bgp->mup_isd_hash = XCALLOC(MTYPE_BGP_MUP_LIST, sizeof(*bgp->mup_isd_hash));
+		bgp_mup_isd_hash_init(bgp->mup_isd_hash);
 	}
-	return bgp->mup_isd_cache;
+	return bgp->mup_isd_hash;
 }
 
-static struct bgp_mup_dsd_list_head *bgp_mup_get_dsd_cache(struct bgp *bgp)
+static struct route_table *bgp_mup_get_isd_lpm(struct bgp *bgp, afi_t afi)
 {
-	if (!bgp->mup_dsd_cache) {
-		bgp->mup_dsd_cache = XCALLOC(MTYPE_BGP_MUP_LIST, sizeof(*bgp->mup_dsd_cache));
-		bgp_mup_dsd_list_init(bgp->mup_dsd_cache);
+	if (afi != AFI_IP && afi != AFI_IP6)
+		return NULL;
+	if (!bgp->mup_isd_lpm[afi])
+		bgp->mup_isd_lpm[afi] = route_table_init();
+	return bgp->mup_isd_lpm[afi];
+}
+
+static struct bgp_mup_dsd_hash_head *bgp_mup_get_dsd_hash(struct bgp *bgp)
+{
+	if (!bgp->mup_dsd_hash) {
+		bgp->mup_dsd_hash = XCALLOC(MTYPE_BGP_MUP_LIST, sizeof(*bgp->mup_dsd_hash));
+		bgp_mup_dsd_hash_init(bgp->mup_dsd_hash);
 	}
-	return bgp->mup_dsd_cache;
+	return bgp->mup_dsd_hash;
+}
+
+static struct bgp_mup_dsd_segid_hash_head *bgp_mup_get_dsd_segid_hash(struct bgp *bgp)
+{
+	if (!bgp->mup_dsd_segid_hash) {
+		bgp->mup_dsd_segid_hash = XCALLOC(MTYPE_BGP_MUP_LIST,
+						  sizeof(*bgp->mup_dsd_segid_hash));
+		bgp_mup_dsd_segid_hash_init(bgp->mup_dsd_segid_hash);
+	}
+	return bgp->mup_dsd_segid_hash;
 }
 
 /* Build a MUP Extended Community of subtype Direct-Type Segment
@@ -644,43 +738,38 @@ static bool bgp_mup_get_sid_structure(const struct attr *attr, struct in6_addr *
 	return true;
 }
 
-static bool bgp_mup_isd_match_key(const struct bgp_mup_isd_entry *e, afi_t afi,
-				  const struct prefix_rd *prd, const struct prefix *prefix)
-{
-	if (e->afi != afi)
-		return false;
-	if (memcmp(e->prd.val, prd->val, sizeof(e->prd.val)) != 0)
-		return false;
-	return prefix_same(&e->prefix, prefix);
-}
-
 static struct bgp_mup_isd_entry *bgp_mup_isd_find(struct bgp *bgp, afi_t afi,
 						  const struct prefix_rd *prd,
 						  const struct prefix *prefix)
 {
-	struct bgp_mup_isd_entry *e;
+	struct bgp_mup_isd_entry needle = {};
 
-	if (!bgp->mup_isd_cache)
+	if (!bgp->mup_isd_hash)
 		return NULL;
-	frr_each (bgp_mup_isd_list, bgp->mup_isd_cache, e) {
-		if (bgp_mup_isd_match_key(e, afi, prd, prefix))
-			return e;
-	}
-	return NULL;
+	needle.afi = afi;
+	needle.prd = *prd;
+	needle.prefix = *prefix;
+	return bgp_mup_isd_hash_find(bgp->mup_isd_hash, &needle);
 }
 
-/* Longest-prefix-match an ISD covering the given endpoint address.
- * Returns the most specific match across all RDs; per the draft the
- * receiving PE has already imported routes by RT, so all entries in the
- * cache are eligible.
+/* Longest-prefix-match an ISD covering the given endpoint address via the
+ * per-AFI route_table.  Per the draft the receiving PE has already imported
+ * routes by RT, so all entries in the cache are eligible; if multiple ISDs
+ * share the same prefix from different RDs, the chain head (insertion order)
+ * is returned, matching the prior linked-list behavior.
  */
 static struct bgp_mup_isd_entry *bgp_mup_isd_lookup(struct bgp *bgp, afi_t afi,
 						    const struct ipaddr *endpoint)
 {
-	struct bgp_mup_isd_entry *e, *best = NULL;
+	struct route_table *table = (afi == AFI_IP || afi == AFI_IP6)
+					    ? bgp->mup_isd_lpm[afi]
+					    : NULL;
+	struct bgp_mup_isd_lpm_chain_head *chain;
+	struct bgp_mup_isd_entry *best = NULL;
+	struct route_node *rn;
 	struct prefix needle = {};
 
-	if (!bgp->mup_isd_cache)
+	if (!table)
 		return NULL;
 
 	if (afi == AFI_IP) {
@@ -693,14 +782,13 @@ static struct bgp_mup_isd_entry *bgp_mup_isd_lookup(struct bgp *bgp, afi_t afi,
 		needle.u.prefix6 = endpoint->ipaddr_v6;
 	}
 
-	frr_each (bgp_mup_isd_list, bgp->mup_isd_cache, e) {
-		if (e->afi != afi)
-			continue;
-		if (!prefix_match(&e->prefix, &needle))
-			continue;
-		if (!best || e->prefix.prefixlen > best->prefix.prefixlen)
-			best = e;
-	}
+	rn = route_node_match(table, &needle);
+	if (!rn)
+		return NULL;
+	chain = rn->info;
+	if (chain)
+		best = bgp_mup_isd_lpm_chain_first(chain);
+	route_unlock_node(rn);
 	return best;
 }
 
@@ -708,34 +796,25 @@ static struct bgp_mup_dsd_entry *bgp_mup_dsd_find_key(struct bgp *bgp, afi_t afi
 						      const struct prefix_rd *prd,
 						      const struct ipaddr *endpoint)
 {
-	struct bgp_mup_dsd_entry *e;
+	struct bgp_mup_dsd_entry needle = {};
 
-	if (!bgp->mup_dsd_cache)
+	if (!bgp->mup_dsd_hash)
 		return NULL;
-	frr_each (bgp_mup_dsd_list, bgp->mup_dsd_cache, e) {
-		if (e->afi != afi)
-			continue;
-		if (memcmp(e->prd.val, prd->val, sizeof(e->prd.val)) != 0)
-			continue;
-		if (!ipaddr_is_same(&e->endpoint, endpoint))
-			continue;
-		return e;
-	}
-	return NULL;
+	needle.afi = afi;
+	needle.prd = *prd;
+	needle.endpoint = *endpoint;
+	return bgp_mup_dsd_hash_find(bgp->mup_dsd_hash, &needle);
 }
 
 /* Lookup a DSD by MUP-EC Direct-Type Segment Identifier. */
 static struct bgp_mup_dsd_entry *bgp_mup_dsd_lookup(struct bgp *bgp, uint64_t segment_id)
 {
-	struct bgp_mup_dsd_entry *e;
+	struct bgp_mup_dsd_entry needle = {};
 
-	if (!bgp->mup_dsd_cache)
+	if (!bgp->mup_dsd_segid_hash)
 		return NULL;
-	frr_each (bgp_mup_dsd_list, bgp->mup_dsd_cache, e) {
-		if (e->has_segment_id && e->segment_id == segment_id)
-			return e;
-	}
-	return NULL;
+	needle.segment_id = segment_id;
+	return bgp_mup_dsd_segid_hash_find(bgp->mup_dsd_segid_hash, &needle);
 }
 
 /* Coalesce reannounce of T1ST/T2ST paths after an ISD/DSD cache mutation.
@@ -743,6 +822,57 @@ static struct bgp_mup_dsd_entry *bgp_mup_dsd_lookup(struct bgp *bgp, uint64_t se
  * single UPDATE collapses to one RIB walk on the next event_loop pass.
  */
 static void bgp_mup_schedule_reannounce_st_routes(struct bgp *bgp, afi_t afi);
+
+/* Insert e into the per-AFI LPM tree.  Multiple ISDs with the same
+ * (afi, prefix) but different RDs share a single route_node and chain
+ * through e->lpm_item; head-of-chain is returned by route_node_match,
+ * preserving "first inserted wins" for equal-length matches.
+ */
+static void bgp_mup_isd_lpm_link(struct bgp *bgp, struct bgp_mup_isd_entry *e)
+{
+	struct route_table *table = bgp_mup_get_isd_lpm(bgp, e->afi);
+	struct bgp_mup_isd_lpm_chain_head *chain;
+	struct route_node *rn;
+
+	if (!table)
+		return;
+	rn = route_node_get(table, &e->prefix);
+	chain = rn->info;
+	if (!chain) {
+		chain = XCALLOC(MTYPE_BGP_MUP_LIST, sizeof(*chain));
+		bgp_mup_isd_lpm_chain_init(chain);
+		route_node_set_info(rn, chain);
+	} else {
+		/* route_node_get bumped lock; chain already holds one */
+		route_unlock_node(rn);
+	}
+	bgp_mup_isd_lpm_chain_add_tail(chain, e);
+}
+
+static void bgp_mup_isd_lpm_unlink(struct bgp *bgp, struct bgp_mup_isd_entry *e)
+{
+	struct route_table *table = (e->afi == AFI_IP || e->afi == AFI_IP6)
+					    ? bgp->mup_isd_lpm[e->afi]
+					    : NULL;
+	struct bgp_mup_isd_lpm_chain_head *chain;
+	struct route_node *rn;
+
+	if (!table)
+		return;
+	rn = route_node_lookup(table, &e->prefix);
+	if (!rn)
+		return;
+	chain = rn->info;
+	if (chain)
+		bgp_mup_isd_lpm_chain_del(chain, e);
+	if (chain && bgp_mup_isd_lpm_chain_count(chain) == 0) {
+		bgp_mup_isd_lpm_chain_fini(chain);
+		XFREE(MTYPE_BGP_MUP_LIST, chain);
+		route_node_set_info(rn, NULL);
+		route_unlock_node(rn); /* drop the lock held while info was set */
+	}
+	route_unlock_node(rn); /* drop the lock from this lookup */
+}
 
 static void bgp_mup_isd_cache_upsert(struct bgp *bgp, afi_t afi, const struct prefix_rd *prd,
 				     const struct prefix *prefix, const struct in6_addr *sid,
@@ -757,7 +887,8 @@ static void bgp_mup_isd_cache_upsert(struct bgp *bgp, afi_t afi, const struct pr
 		e->afi = afi;
 		e->prd = *prd;
 		e->prefix = *prefix;
-		bgp_mup_isd_list_add_tail(bgp_mup_get_isd_cache(bgp), e);
+		bgp_mup_isd_hash_add(bgp_mup_get_isd_hash(bgp), e);
+		bgp_mup_isd_lpm_link(bgp, e);
 		changed = true;
 	} else if (memcmp(&e->sid, sid, sizeof(*sid)) != 0 || e->loc_block_len != block ||
 		   e->loc_node_len != node || e->func_len != func || e->arg_len != arg ||
@@ -781,9 +912,39 @@ static void bgp_mup_isd_cache_remove(struct bgp *bgp, afi_t afi, const struct pr
 
 	if (!e)
 		return;
-	bgp_mup_isd_list_del(bgp->mup_isd_cache, e);
+	bgp_mup_isd_lpm_unlink(bgp, e);
+	bgp_mup_isd_hash_del(bgp->mup_isd_hash, e);
 	XFREE(MTYPE_BGP_MUP_ISD, e);
 	bgp_mup_schedule_reannounce_st_routes(bgp, afi);
+}
+
+/* Maintain the segment_id index alongside the (prd, endpoint) hash.
+ * If two DSDs claim the same segment_id, the second link is refused so
+ * lookup keeps "first inserter wins" semantics, matching the prior
+ * linear-scan behavior.
+ */
+static void bgp_mup_dsd_segid_link(struct bgp *bgp, struct bgp_mup_dsd_entry *e)
+{
+	struct bgp_mup_dsd_entry *prev;
+
+	if (!e->has_segment_id || e->segid_linked)
+		return;
+	prev = bgp_mup_dsd_segid_hash_add(bgp_mup_get_dsd_segid_hash(bgp), e);
+	if (prev) {
+		zlog_warn("BGP-MUP: duplicate DSD segment-id %" PRIu64
+			  " — keeping first-bound entry",
+			  e->segment_id);
+		return;
+	}
+	e->segid_linked = true;
+}
+
+static void bgp_mup_dsd_segid_unlink(struct bgp *bgp, struct bgp_mup_dsd_entry *e)
+{
+	if (!e->segid_linked)
+		return;
+	bgp_mup_dsd_segid_hash_del(bgp->mup_dsd_segid_hash, e);
+	e->segid_linked = false;
 }
 
 static void bgp_mup_dsd_cache_upsert(struct bgp *bgp, afi_t afi, const struct prefix_rd *prd,
@@ -799,7 +960,7 @@ static void bgp_mup_dsd_cache_upsert(struct bgp *bgp, afi_t afi, const struct pr
 		e->afi = afi;
 		e->prd = *prd;
 		e->endpoint = *endpoint;
-		bgp_mup_dsd_list_add_tail(bgp_mup_get_dsd_cache(bgp), e);
+		bgp_mup_dsd_hash_add(bgp_mup_get_dsd_hash(bgp), e);
 		changed = true;
 	} else if (memcmp(&e->sid, sid, sizeof(*sid)) != 0 || e->loc_block_len != block ||
 		   e->loc_node_len != node || e->func_len != func || e->arg_len != arg ||
@@ -807,6 +968,9 @@ static void bgp_mup_dsd_cache_upsert(struct bgp *bgp, afi_t afi, const struct pr
 		   e->segment_id != segment_id) {
 		changed = true;
 	}
+	if (e->segid_linked &&
+	    (!has_segment_id || e->segment_id != segment_id))
+		bgp_mup_dsd_segid_unlink(bgp, e);
 	e->sid = *sid;
 	e->loc_block_len = block;
 	e->loc_node_len = node;
@@ -815,6 +979,8 @@ static void bgp_mup_dsd_cache_upsert(struct bgp *bgp, afi_t afi, const struct pr
 	e->behavior = behavior;
 	e->has_segment_id = has_segment_id;
 	e->segment_id = segment_id;
+	if (has_segment_id && !e->segid_linked)
+		bgp_mup_dsd_segid_link(bgp, e);
 	if (changed)
 		bgp_mup_schedule_reannounce_st_routes(bgp, afi);
 }
@@ -826,7 +992,8 @@ static void bgp_mup_dsd_cache_remove(struct bgp *bgp, afi_t afi, const struct pr
 
 	if (!e)
 		return;
-	bgp_mup_dsd_list_del(bgp->mup_dsd_cache, e);
+	bgp_mup_dsd_segid_unlink(bgp, e);
+	bgp_mup_dsd_hash_del(bgp->mup_dsd_hash, e);
 	XFREE(MTYPE_BGP_MUP_DSD, e);
 	bgp_mup_schedule_reannounce_st_routes(bgp, afi);
 }
@@ -840,17 +1007,31 @@ void bgp_mup_caches_free(struct bgp *bgp)
 	for (afi = AFI_IP; afi < AFI_MAX; afi++)
 		event_cancel(&bgp->mup_reannounce_ev[afi]);
 
-	if (bgp->mup_isd_cache) {
-		while ((isd = bgp_mup_isd_list_pop(bgp->mup_isd_cache)))
+	if (bgp->mup_isd_hash) {
+		while ((isd = bgp_mup_isd_hash_pop(bgp->mup_isd_hash))) {
+			bgp_mup_isd_lpm_unlink(bgp, isd);
 			XFREE(MTYPE_BGP_MUP_ISD, isd);
-		bgp_mup_isd_list_fini(bgp->mup_isd_cache);
-		XFREE(MTYPE_BGP_MUP_LIST, bgp->mup_isd_cache);
+		}
+		bgp_mup_isd_hash_fini(bgp->mup_isd_hash);
+		XFREE(MTYPE_BGP_MUP_LIST, bgp->mup_isd_hash);
 	}
-	if (bgp->mup_dsd_cache) {
-		while ((dsd = bgp_mup_dsd_list_pop(bgp->mup_dsd_cache)))
+	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
+		if (bgp->mup_isd_lpm[afi]) {
+			route_table_finish(bgp->mup_isd_lpm[afi]);
+			bgp->mup_isd_lpm[afi] = NULL;
+		}
+	}
+	if (bgp->mup_dsd_hash) {
+		while ((dsd = bgp_mup_dsd_hash_pop(bgp->mup_dsd_hash))) {
+			bgp_mup_dsd_segid_unlink(bgp, dsd);
 			XFREE(MTYPE_BGP_MUP_DSD, dsd);
-		bgp_mup_dsd_list_fini(bgp->mup_dsd_cache);
-		XFREE(MTYPE_BGP_MUP_LIST, bgp->mup_dsd_cache);
+		}
+		bgp_mup_dsd_hash_fini(bgp->mup_dsd_hash);
+		XFREE(MTYPE_BGP_MUP_LIST, bgp->mup_dsd_hash);
+	}
+	if (bgp->mup_dsd_segid_hash) {
+		bgp_mup_dsd_segid_hash_fini(bgp->mup_dsd_segid_hash);
+		XFREE(MTYPE_BGP_MUP_LIST, bgp->mup_dsd_segid_hash);
 	}
 }
 
