@@ -1134,6 +1134,16 @@ struct bgp {
 	 */
 	struct event *mup_reannounce_ev[AFI_MAX];
 
+	/* BGP-MUP per-vrf-per-afi import RT list, populated by
+	 * `route-target import RTLIST` under `address-family ipv[46] mup`.
+	 * A T1ST/T2ST received in the default-vrf MUP RIB is installed in
+	 * this vrf iff one of its RTs appears here.  ISD/DSD entries are
+	 * cached only when at least one vrf imports the route's RT.
+	 * Mirrors L3VPN's vpn_policy[afi].rtlist[FROMVPN] but kept separate
+	 * so a vrf doing both L3VPN and MUP can scope import RTs per AF.
+	 */
+	struct ecommunity *mup_import_rtlist[AFI_MAX];
+
 	/* TCP keepalive parameters for BGP connection */
 	uint16_t tcp_keepalive_idle;
 	uint16_t tcp_keepalive_intvl;
