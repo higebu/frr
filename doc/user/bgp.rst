@@ -4432,62 +4432,70 @@ parse all four route types per draft-ietf-bess-mup-safi.
 Originating ISD / DSD as a MUP-PE / MUP-GW
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When FRR plays the MUP-PE / MUP-GW role, ISD and DSD origination use
-two distinct configuration surfaces, both bound to a non-default-vrf
-bgp instance (RFC 8986 §4.7-§4.8: ``End.DT4``/``End.DT6`` are
-vrf-mandatory):
+When FRR plays the MUP-PE / MUP-GW role, every VRF-local MUP knob
+lives under ``address-family ipv4|ipv6 unicast`` of a non-default-vrf
+bgp instance (RFC 8986 Section 4.7-Section 4.8: ``End.DT4`` /
+``End.DT6`` are vrf-mandatory).  This mirrors L3VPN one-for-one:
+``rd vpn export`` / ``rt vpn import|export|both`` /
+``sid vpn export`` all live under unicast, and the ``vpn`` SAFI node
+is reduced to peer activation / show / debug / retain knobs.  BGP-MUP
+follows the same split.
 
 * **ISD** is driven from the per-vrf unicast RIB.  Configure
-  ``rd mup export`` / ``rt mup export`` (and optionally
-  ``sid mup export``) under
-  ``address-family ipv4 unicast`` /
-  ``address-family ipv6 unicast`` of the per-vrf bgp instance.  Every
-  selected best-path in that unicast RIB — populated via ``network``,
-  ``redistribute connected``, ``redistribute static``, peer-learned
-  routes, aggregates — is then leaked into the BGP-MUP SAFI as an ISD
-  NLRI.  This mirrors L3VPN's
-  ``rd vpn export`` / ``rt vpn export`` / ``sid vpn export`` model.
+  ``rd mup export`` / ``rt mup export`` (or ``rt mup both``) /
+  ``sid mup export`` plus ``segment mup export interwork`` under the
+  unicast AF.  Every selected best-path in that unicast RIB —
+  populated via ``network``, ``redistribute connected``,
+  ``redistribute static``, peer-learned routes, aggregates — is then
+  leaked into the BGP-MUP SAFI as an ISD NLRI.
 
   ISD prefixes carry **N3 (gNB-side) reachability** per
-  draft-ietf-bess-mup-safi §3.3.1 ("route per each N3RAN IP prefix"),
-  not UE prefixes.  UE prefixes are matched at the receiver via T1ST
-  resolution (§3.3.9) but they are not advertised by ISD.
+  draft-ietf-bess-mup-safi Section 3.3.1 ("route per each N3RAN IP
+  prefix"), not UE prefixes.  UE prefixes are matched at the receiver
+  via T1ST resolution (Section 3.3.9) but they are not advertised by
+  ISD.
 
-* **DSD** is configured per-host with the ``segment direct`` command
-  under ``address-family ipv4|ipv6 mup``.  ``segment direct`` is
-  unchanged from earlier releases.
+* **DSD** is a single per-(vrf, afi) NLRI.  The originator-address
+  defaults to the bgp router-id and can be overridden via
+  ``segment mup export direct address X``; the End.DT* behavior is
+  selected via ``behavior mup export <dt4|dt6|dt46>``; the MUP
+  extended community (Direct-Type Segment Identifier) via
+  ``ext-community mup export ASN:NN``; the prefix-SID via
+  ``sid mup export``.
 
 A configured SRv6 locator must be referenced under
 ``router bgp / segment-routing srv6 / locator <name>`` first; bgpd
 then asks zebra's SRv6 SID manager to allocate functions under that
-locator (one per ``(vrf, AFI)`` for ISD; one per host for DSD).
+locator (one per ``(vrf, AFI)`` for ISD; one per ``(vrf, AFI)`` for
+DSD).
 
 .. clicmd:: rd mup export AS:NN|IP:nn
 
-   Specify the route distinguisher to be attached to ISD NLRIs leaked
-   from the current unicast vrf to the BGP-MUP SAFI.  Only valid under
-   ``address-family ipv4 unicast`` / ``address-family ipv6 unicast``
-   of a non-default-vrf bgp instance.  Sibling of ``rd vpn export``.
+   Specify the route distinguisher to be attached to ISD/DSD NLRIs
+   leaked from the current unicast vrf to the BGP-MUP SAFI.  Only
+   valid under ``address-family ipv4|ipv6 unicast`` of a
+   non-default-vrf bgp instance.  Sibling of ``rd vpn export``.
 
-.. clicmd:: rt mup export RTLIST...
+.. clicmd:: rt mup <import|export|both> RTLIST...
 
-   Specify the space-separated route-target list to be attached to
-   ISD NLRIs leaked from the current unicast vrf to BGP-MUP.  Only
-   valid under unicast AF of a non-default-vrf bgp instance.
-   Sibling of ``rt vpn export``.
+   Specify the space-separated route-target list applied between the
+   current unicast address-family and BGP-MUP.  ``import`` matches
+   any RT in incoming MUP NLRIs (gates which T1ST/T2ST install in
+   this vrf); ``export`` is set on every leaked ISD/DSD NLRI; ``both``
+   is the syntactic shorthand for the same RTLIST in both directions.
+   Only valid under unicast AF of a non-default-vrf bgp instance.
+   Sibling of ``rt vpn <import|export|both>``.
 
 .. clicmd:: sid mup export <auto|explicit X:X::X:X> [locator NAME]
 
-   Allocate the SRv6 prefix-SID attached to ISD NLRIs leaked from the
-   current ``(vrf, AFI)``.  Per draft-ietf-bess-mup-safi §3.3.1 the
-   behaviour MUST be ``End.M.GTP4.E`` for the IPv4 sub-AFI and
-   ``End.M.GTP6.E`` for the IPv6 sub-AFI; the behaviour is selected
-   automatically.  ``auto`` requests a per-``(vrf, AFI)`` function
-   from zebra's SRv6 SID manager (one SID covers every ISD NLRI from
-   the same vrf/AFI — receivers disambiguate per-session flows via
-   the T1ST NLRI, not via the ISD SID).  ``explicit`` is an escape
-   hatch for inter-AS or migration scenarios that need a pinned SID
-   value.  Sibling of ``sid vpn export``.
+   Allocate the SRv6 prefix-SID attached to ISD/DSD NLRIs leaked from
+   the current ``(vrf, AFI)``.  Per draft-ietf-bess-mup-safi
+   Section 3.3.1 the ISD behavior MUST be ``End.M.GTP4.E`` for the
+   IPv4 sub-AFI and ``End.M.GTP6.E`` for the IPv6 sub-AFI; the
+   behavior is selected automatically.  ``auto`` requests a per-(vrf,
+   AFI) function from zebra's SRv6 SID manager.  ``explicit`` is an
+   escape hatch for inter-AS or migration scenarios that need a
+   pinned SID value.  Sibling of ``sid vpn export``.
 
    The optional ``locator NAME`` token overrides the bgp instance's
    ``segment-routing srv6 locator`` default for this single
@@ -4501,21 +4509,27 @@ locator (one per ``(vrf, AFI)`` for ISD; one per host for DSD).
    while keeping L3VPN SIDs on the bgp default locator.  When the
    token is omitted, ``bgp->srv6_locator_name`` is used.
 
-.. clicmd:: [no] segment direct <A.B.C.D|X:X::X:X> rd <RD> rt <RT> mup <ASN:NN> behavior <dt4|dt6|dt46> [sid explicit X:X::X:X]
+.. clicmd:: segment mup export <direct|interwork> [address A.B.C.D]
 
-   Originate a Direct Segment Discovery (DSD) route.  ``<ADDR>`` is
-   the DSD NLRI's *Address* field per draft-ietf-bess-mup-safi
-   §3.1.2 — the address of the originating BGP speaker; in the 3GPP
-   5G architecture this is typically the UPF host's IP.
+   Master enable for ISD (``interwork``) or DSD (``direct``)
+   origination on this (vrf, AFI).  ``address`` is valid only with
+   ``direct`` and overrides the DSD NLRI's *Address* field
+   (draft Section 3.1.2 — the address of the originating BGP
+   speaker; defaults to the bgp router-id when omitted).
 
-   ``behavior`` selects the prefix-SID's End.DT* function and is
-   mandatory: per draft §3.3.4 the function MAY be ``End.DT4`` /
-   ``End.DT6`` / ``End.DT46``, with the choice driven by the inner
-   PDU lookup AFI (PDU session type), which is independent of the
-   DSD Address AFI.  The operator must therefore declare it
-   explicitly — there is no AFI-derived default.
+.. clicmd:: behavior mup export <dt4|dt6|dt46>
 
-   The ``mup`` keyword carries the MUP Extended Community.
+   Select the DSD prefix-SID's End.DT* function.  Per
+   draft Section 3.3.4 the function reflects the inner PDU lookup
+   AFI (PDU session type), which is independent of the DSD's
+   Address AFI; the operator MUST declare it explicitly.  Required
+   for DSD origination.
+
+.. clicmd:: ext-community mup export ASN:NN
+
+   Set the MUP Direct-Type Segment Identifier extended community
+   (draft Section 4.2) carried on every DSD originated from this
+   (vrf, AFI).  Required for DSD origination.
 
 Example:
 
@@ -4528,6 +4542,7 @@ Example:
        prefix 2001:db8:e::/48 block-len 24 node-len 24 func-bits 8
    !
    router bgp 65001
+    bgp router-id 1.1.1.1
     neighbor 2001:db8::2 remote-as 65002
     !
     segment-routing srv6
@@ -4544,6 +4559,7 @@ Example:
    exit
    !
    router bgp 65001 vrf slice1
+    bgp router-id 1.1.1.1
     !
     segment-routing srv6
      locator default
@@ -4554,10 +4570,10 @@ Example:
      rd mup export 100:100
      rt mup export 65001:1
      sid mup export auto
-    exit-address-family
-    !
-    address-family ipv4 mup
-     segment direct 10.0.0.250 rd 100:100 rt 65001:1 mup 65001:10 behavior dt4
+     segment mup export interwork
+     segment mup export direct address 10.0.0.250
+     behavior mup export dt4
+     ext-community mup export 65001:10
     exit-address-family
     !
     address-family ipv6 unicast
@@ -4565,6 +4581,7 @@ Example:
      rd mup export 200:200
      rt mup export 65001:2
      sid mup export auto
+     segment mup export interwork
     exit-address-family
    exit
 
@@ -4582,25 +4599,23 @@ Importing received MUP routes into a vrf
 
 A non-default-vrf bgp instance imports received MUP routes whose
 Route-Target extended community matches one of its configured
-``route-target import`` lines.  This mirrors L3VPN's
-``route-target vpn import`` and the receive side of
-``vpn_leak_to_vrf_update_onevrf``: a vrf with no ``route-target
-import`` line imports nothing, regardless of the RTs it exports via
-``segment ... rt RT``.
+``rt mup import`` (or ``rt mup both``) RTs.  This mirrors L3VPN's
+``rt vpn import`` and the receive side of
+``vpn_leak_to_vrf_update_onevrf``: a vrf with no ``rt mup import``
+line imports nothing, regardless of the RTs it exports.
 
-.. clicmd:: [no] route-target import RTLIST
+A typical pure receive-only PE looks like::
 
-   Configure the per-vrf RT import filter under ``address-family ipv4
-   mup`` / ``address-family ipv6 mup`` of a non-default-vrf bgp
-   instance.  ``RTLIST`` is a space-separated list of RT extended
-   communities (``ASN:NN`` or ``A.B.C.D:NN``).  An incoming MUP route
-   is imported into this vrf iff its RT matches at least one RT in
-   the list.
+   router bgp 65002 vrf slice1
+    address-family ipv4 unicast
+     rt mup import 65001:1
+    exit-address-family
+   exit
 
-   This command is mandatory for receive: a vrf without it never
-   imports received MUP routes.  Origination-side ``segment ... rt
-   RT`` lines do **not** double as an implicit import — export and
-   import RTs are independent, exactly as in L3VPN.
+The ``rt mup import`` line is mandatory for receive: a vrf without it
+never imports received MUP routes.  Origination-side ``rt mup export``
+lines do **not** double as an implicit import — export and import
+RTs are independent, exactly as in L3VPN.
 
 .. _bgp-conditional-advertisement:
 

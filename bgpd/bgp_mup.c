@@ -66,24 +66,48 @@ struct bgp_mup_state {
 
 static struct bgp_mup_state *bgp_mup_state_get(struct bgp *bgp);
 
-/* Per-vrf-per-afi MUP export policy.  Mirrors L3VPN's vpn_policy[afi]
- * (TOVPN direction): RD, RT list, and SID allocation knob configured
- * via `rd mup export` / `rt mup export` / `sid mup export` under
- * `address-family ipv[46] unicast` on a non-default-VRF instance.
+/* Per-vrf-per-afi MUP policy.  Mirrors L3VPN's vpn_policy[afi]: RD,
+ * RT list (both directions), and SID allocation knob configured under
+ * `address-family ipv[46] unicast` on a non-default-VRF instance via
+ * `rd mup export`, `rt mup <import|export|both>`, and
+ * `sid mup export`.
+ *
+ * The rtlist[] array indexes by direction so a single policy struct
+ * holds both the export RT list (attached to leaked ISDs) and the
+ * import RT list (gates which received MUP NLRIs install in this vrf).
+ * Mirrors bgp_mplsvpn.c's vpn_policy[afi].rtlist[BGP_VPN_POLICY_DIR_*].
  *
  * Lazily allocated by bgp_mup_export_get() on first CLI mutation;
  * freed by bgp_mup_state_free() on instance teardown.
  */
+enum bgp_mup_policy_dir {
+	BGP_MUP_POLICY_DIR_FROMMUP = 0,
+	BGP_MUP_POLICY_DIR_TOMUP = 1,
+	BGP_MUP_POLICY_DIR_MAX = 2,
+};
+
 struct bgp_mup_export_policy {
 	uint32_t flags;
 #define BGP_MUP_EXPORT_RD_SET (1U << 0)
 #define BGP_MUP_EXPORT_SID_AUTO (1U << 1)
 #define BGP_MUP_EXPORT_SID_EXPLICIT (1U << 2)
 #define BGP_MUP_EXPORT_NEXTHOP_SET (1U << 3)
+/* Operator explicitly enabled ISD origination for this (vrf, afi)
+ * via `segment mup export interwork`.
+ */
+#define BGP_MUP_EXPORT_SEGMENT_INTERWORK (1U << 4)
+/* Operator explicitly enabled DSD origination for this (vrf, afi)
+ * via `segment mup export direct [address X]`.
+ */
+#define BGP_MUP_EXPORT_SEGMENT_DIRECT (1U << 5)
+/* DSD address was set explicitly via `segment mup export direct
+ * address X` (otherwise default to router-id).
+ */
+#define BGP_MUP_EXPORT_DSD_ADDRESS_SET (1U << 6)
 
 	char *tovpn_rd_pretty;
 	struct prefix_rd tovpn_rd;
-	struct ecommunity *tovpn_rtlist;
+	struct ecommunity *rtlist[BGP_MUP_POLICY_DIR_MAX];
 
 	/* Optional per-policy locator override.  NULL => fall back to
 	 * bgp->srv6_locator_name.  Deliberate deviation from L3VPN's
@@ -122,6 +146,21 @@ struct bgp_mup_export_policy {
 	 */
 	struct in6_addr last_installed_sid;
 	enum seg6local_action_t last_installed_act;
+
+	/* DSD scalar (segment mup export direct) origination metadata.
+	 * DSD is a single-NLRI knob per (vrf, afi): the originator-address
+	 * defaults to the speaker's router-id and can be overridden via
+	 * `segment mup export direct address X`; the End.DT* behavior is
+	 * configured via `behavior mup export <dt4|dt6|dt46>`; the MUP
+	 * extended community is configured via `ext-community mup export
+	 * ASN:NN`.  RD/RT/SID come from the shared `rd mup export` /
+	 * `rt mup export` / `sid mup export` knobs already on this policy.
+	 */
+	struct ipaddr dsd_address;
+	uint16_t dsd_behavior; /* End.DT4 / End.DT6 / End.DT46 */
+	uint32_t dsd_mup_as;
+	uint32_t dsd_mup_val;
+	char *dsd_mup_str; /* verbatim for writeback */
 };
 
 /* Resolve the locator name an export policy should use.  Returns the
@@ -184,6 +223,7 @@ static struct bgp_mup_export_policy *bgp_mup_export_peek(struct bgp *bgp, afi_t 
 static void bgp_mup_export_clear(struct bgp *bgp, afi_t afi)
 {
 	struct bgp_mup_export_policy *p;
+	enum bgp_mup_policy_dir dir;
 
 	if (afi != AFI_IP && afi != AFI_IP6)
 		return;
@@ -191,9 +231,12 @@ static void bgp_mup_export_clear(struct bgp *bgp, afi_t afi)
 	if (!p)
 		return;
 	XFREE(MTYPE_BGP_NAME, p->tovpn_rd_pretty);
-	if (p->tovpn_rtlist)
-		ecommunity_free(&p->tovpn_rtlist);
+	for (dir = 0; dir < BGP_MUP_POLICY_DIR_MAX; ++dir) {
+		if (p->rtlist[dir])
+			ecommunity_free(&p->rtlist[dir]);
+	}
 	XFREE(MTYPE_BGP_NAME, p->locator_name);
+	XFREE(MTYPE_BGP_MUP_STR, p->dsd_mup_str);
 	XFREE(MTYPE_BGP_MUP_EXPORT, bgp->mup_export[afi]);
 }
 
@@ -1990,17 +2033,20 @@ static bool bgp_mup_dsd_is_self(uint64_t segment_id)
  */
 static afi_t bgp_mup_afi_from_prefix(const struct mup_prefix *mp);
 
-/* True iff any RT carried on `attr` appears in `bgp`'s per-afi
- * MUP import RT list.  Mirrors L3VPN's vpn_leak_to_vrf_update_onevrf
- * (bgp_mplsvpn.c) `ecommunity_include` test against
- * vpn_policy[afi].rtlist[FROMVPN].
+/* True iff any RT carried on `attr` appears in `bgp`'s per-(vrf, afi)
+ * MUP import RT list (mup_export[afi]->rtlist[FROMMUP]).  Mirrors
+ * L3VPN's vpn_leak_to_vrf_update_onevrf (bgp_mplsvpn.c)
+ * `ecommunity_include` test against vpn_policy[afi].rtlist[FROMVPN].
  */
 static bool bgp_mup_route_rt_in_import(struct bgp *bgp, afi_t afi,
 				       struct ecommunity *route_rt)
 {
-	if (!bgp->mup_import_rtlist[afi])
+	struct bgp_mup_export_policy *ep = bgp_mup_export_peek(bgp, afi);
+
+	if (!ep || !ep->rtlist[BGP_MUP_POLICY_DIR_FROMMUP])
 		return false;
-	return ecommunity_include(bgp->mup_import_rtlist[afi], route_rt);
+	return ecommunity_include(ep->rtlist[BGP_MUP_POLICY_DIR_FROMMUP],
+				  route_rt);
 }
 
 /* True iff at least one per-vrf bgp instance imports the RT carried on
@@ -2038,7 +2084,8 @@ static bool bgp_mup_any_vrf_imports(afi_t afi, const struct attr *attr)
  * i.e. the NLRI should be dropped on receive when the default-instance
  * is configured `no bgp retain route-target all`.  Mirrors L3VPN's
  * vpn_leak_to_vrf_no_retain_filter_check (bgpd/bgp_mplsvpn.c) one-to-one,
- * substituting mup_import_rtlist for vpn_policy[afi].rtlist[FROMVPN].
+ * substituting mup_export[afi]->rtlist[FROMMUP] for
+ * vpn_policy[afi].rtlist[FROMVPN].
  */
 bool bgp_mup_no_retain_filter_check(struct bgp *bgp, struct attr *attr, afi_t afi)
 {
@@ -3458,7 +3505,9 @@ void mup_leak_from_vrf_update(struct bgp *to_bgp, struct bgp *from_bgp,
 		return;
 
 	ep = bgp_mup_export_peek(from_bgp, afi);
-	if (!ep || !(ep->flags & BGP_MUP_EXPORT_RD_SET) || !ep->tovpn_rtlist)
+	if (!ep || !(ep->flags & BGP_MUP_EXPORT_SEGMENT_INTERWORK) ||
+	    !(ep->flags & BGP_MUP_EXPORT_RD_SET) ||
+	    !ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP])
 		return;
 
 	/* Mirror vpn_leak_from_vrf_update's gate: do NOT require
@@ -3481,7 +3530,7 @@ void mup_leak_from_vrf_update(struct bgp *to_bgp, struct bgp *from_bgp,
 
 	args.afi = afi;
 	args.prd = ep->tovpn_rd;
-	args.ecom = ep->tovpn_rtlist;
+	args.ecom = ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP];
 	args.isd_prefix = *p;
 	(void)bgp_mup_emit_isd(to_bgp, from_bgp, &args, &ep->tovpn_sid, false);
 }
@@ -3512,7 +3561,7 @@ void mup_leak_from_vrf_withdraw(struct bgp *to_bgp, struct bgp *from_bgp,
 
 	args.afi = afi;
 	args.prd = ep->tovpn_rd;
-	args.ecom = ep->tovpn_rtlist;
+	args.ecom = ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP];
 	args.isd_prefix = *p;
 	(void)bgp_mup_emit_isd(to_bgp, from_bgp, &args, &dummy, true);
 	/* Per design: do not release the SID — it is shared per (vrf, afi). */
@@ -3596,7 +3645,7 @@ void mup_leak_from_vrf_withdraw_all(struct bgp *to_bgp, struct bgp *from_bgp, af
 				continue;
 			args.afi = afi;
 			args.prd = ep->tovpn_rd;
-			args.ecom = ep->tovpn_rtlist;
+			args.ecom = ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP];
 			if (afi == AFI_IP) {
 				args.isd_prefix.family = AF_INET;
 				args.isd_prefix.prefixlen = pm->prefix.isd_route.ip_prefix_length;
@@ -3657,18 +3706,6 @@ static const struct {
 	{ "dt46", SRV6_ENDPOINT_BEHAVIOR_END_DT46 },
 };
 
-static uint16_t mup_dsd_behavior_keyword2code(const char *keyword)
-{
-	size_t i;
-
-	if (!keyword)
-		return 0;
-	for (i = 0; i < array_size(mup_dsd_behaviors); i++)
-		if (strcmp(keyword, mup_dsd_behaviors[i].kw) == 0)
-			return mup_dsd_behaviors[i].code;
-	return 0;
-}
-
 static const char *mup_dsd_behavior_code2keyword(uint16_t code)
 {
 	size_t i;
@@ -3698,130 +3735,137 @@ static enum seg6local_action_t bgp_mup_dsd_zebra_action(uint16_t behavior)
 	}
 }
 
-/* Common parse for `rd <rd> rt <rt>`. */
-static int mup_route_common_args(struct vty *vty, const char *rd_str, const char *rt_str,
-				 struct prefix_rd *prd, struct ecommunity **rt)
+/* DSD scalar singleton emit: build an `args` from the per-(vrf, afi)
+ * export policy and call bgp_mup_originate_dsd().  The DSD address
+ * defaults to the speaker's bgp router-id and can be overridden via
+ * `segment mup export direct address X` on the policy.  The MUP-EC
+ * (Direct-Type Segment Identifier) is configured via
+ * `ext-community mup export ASN:NN`; the End.DT* behavior via
+ * `behavior mup export <dt4|dt6|dt46>`.  RD / RT / SID come from
+ * the shared `rd|rt|sid mup export` knobs already on this policy.
+ *
+ * The previous per-prefix `segment direct ADDR rd ... rt ... mup ...
+ * behavior ... [sid explicit ...]` collection is gone; this is a
+ * single DSD per (vrf, afi) — see refactor issue 210805 Move (2)
+ * option (d).
+ */
+static bool mup_dsd_policy_ready(const struct bgp_mup_export_policy *ep)
 {
-	if (str2prefix_rd(rd_str, prd) == 0) {
-		vty_out(vty, "%% Malformed rd\n");
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-	*rt = ecommunity_str2com(rt_str, ECOMMUNITY_ROUTE_TARGET, 0);
-	if (!*rt) {
-		vty_out(vty, "%% Malformed RT \"%s\"\n", rt_str);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-	return CMD_SUCCESS;
+	if (!ep)
+		return false;
+	if (!(ep->flags & BGP_MUP_EXPORT_SEGMENT_DIRECT))
+		return false;
+	if (!(ep->flags & BGP_MUP_EXPORT_RD_SET))
+		return false;
+	if (!ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP])
+		return false;
+	if (!ep->dsd_mup_str || !ep->dsd_behavior)
+		return false;
+	return true;
 }
 
-/* `segment direct <ADDR> rd RD rt RT mup MUP
- *  behavior <dt4|dt6|dt46> [sid explicit X:X::X:X]`
- *
- * <ADDR> is the DSD NLRI's Address field per draft-ietf-bess-mup-safi
- * Section 3.1.2 (the address of the originating BGP speaker; in 3GPP 5G
- * architecture this is typically the UPF host's IP).  `behavior`
- * picks the prefix-SID's End.DT* function — it reflects the inner
- * PDU lookup AFI (PDU session type), which is independent of the
- * Address AFI per draft Section 3.3.4, so the operator MUST declare it
- * explicitly.  Function bits auto-allocate from the locator by
- * default; `sid explicit` pins a specific value (inter-AS / migration
- * escape hatch).
- */
-DEFPY(bgp_mup_segment_direct,
-      bgp_mup_segment_direct_cmd,
-      "[no] segment direct <A.B.C.D$v4_addr|X:X::X:X$v6_addr>"
-      " rd ASN:NN_OR_IP-ADDRESS:NN$rd_str"
-      " rt WORD$rt_str"
-      " mup ASN:NN$mup_str"
-      " behavior <dt4|dt6|dt46>$behavior"
-      " [sid explicit X:X::X:X$sid_explicit]",
-      NO_STR
-      "BGP-MUP segment to originate\n"
-      "Direct Segment Discovery route (single Address per draft-ietf-bess-mup-safi Section 3.1.2)\n"
-      "IPv4 originating-speaker address\n"
-      "IPv6 originating-speaker address\n"
-      "Route Distinguisher\n"
-      "RD value\n"
-      "Route Target extended community\n"
-      "RT (e.g. \"65000:1\")\n"
-      "MUP extended community\n"
-      "MUP segment identifier (ASN:NN)\n"
-      "SRv6 endpoint behavior (selects the inner PDU lookup AFI; independent of the Address AFI)\n"
-      "End.DT4 — decap and lookup in the IPv4 table\n"
-      "End.DT6 — decap and lookup in the IPv6 table\n"
-      "End.DT46 — decap and lookup in either IPv4 or IPv6 table (unified)\n"
-      "Pin a specific SID instead of auto-allocating from the locator\n"
-      "Specify the SID value explicitly\n"
-      "IPv6 SID address\n")
+static void mup_dsd_args_from_policy(struct bgp *bgp, afi_t afi,
+				     const struct bgp_mup_export_policy *ep,
+				     struct bgp_mup_origin_args *args,
+				     struct ecommunity **out_rt,
+				     struct ecommunity **out_mup_ec,
+				     struct ecommunity **out_ecom)
 {
-	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct ecommunity *rt = ecommunity_dup(ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP]);
+	struct ecommunity *mup_ec = bgp_mup_build_mup_ec(ep->dsd_mup_str);
+
+	args->afi = afi;
+	args->prd = ep->tovpn_rd;
+	args->dsd_behavior = ep->dsd_behavior;
+
+	if (ep->flags & BGP_MUP_EXPORT_DSD_ADDRESS_SET) {
+		args->dsd_endpoint = ep->dsd_address;
+	} else {
+		/* Default to bgp router-id (IPv4).  When the policy is on
+		 * AFI_IP6 we still use the IPv4 router-id encoded as IPADDR_V4
+		 * — the DSD NLRI's Address AFI is independent from the
+		 * inner-PDU AFI per draft-ietf-bess-mup-safi Section 3.3.4.
+		 */
+		args->dsd_endpoint.ipa_type = IPADDR_V4;
+		args->dsd_endpoint.ipaddr_v4 = bgp->router_id;
+	}
+
+	if (ep->flags & BGP_MUP_EXPORT_SID_EXPLICIT) {
+		args->has_explicit_sid = true;
+		args->explicit_sid = ep->tovpn_sid_explicit;
+	}
+
+	*out_rt = rt;
+	*out_mup_ec = mup_ec;
+	if (rt && mup_ec)
+		*out_ecom = ecommunity_merge(ecommunity_dup(rt), mup_ec);
+	else
+		*out_ecom = NULL;
+	args->ecom = *out_ecom;
+}
+
+static void mup_dsd_emit_singleton(struct bgp *bgp, afi_t afi, bool withdraw)
+{
+	struct bgp_mup_export_policy *ep = bgp_mup_export_peek(bgp, afi);
 	struct bgp_mup_origin_args args = {};
 	struct ecommunity *rt = NULL, *mup_ec = NULL, *ecom = NULL;
-	uint16_t bcode = 0;
-	bool withdraw = !!no;
-	int rv, idx;
 
-	if (bgp->vrf_id == VRF_DEFAULT) {
-		vty_out(vty,
-			"%% segment direct must be configured under a non-default vrf bgp instance (`router bgp ASN vrf NAME`); End.DT4/DT6 are vrf-mandatory per RFC 8986 Section 4.7-Section 4.8\n");
-		return CMD_WARNING_CONFIG_FAILED;
+	if (!mup_dsd_policy_ready(ep))
+		return;
+	if (!withdraw && bgp->router_id.s_addr == 0 &&
+	    !(ep->flags & BGP_MUP_EXPORT_DSD_ADDRESS_SET)) {
+		zlog_warn("BGP-MUP: vrf %s has no router-id and no `segment mup export direct address` override; deferring DSD origination",
+			  bgp->name ? bgp->name : "default");
+		return;
 	}
 
-	if (v4_addr_str) {
-		args.afi = AFI_IP;
-		args.dsd_endpoint.ipa_type = IPADDR_V4;
-		if (inet_pton(AF_INET, v4_addr_str, &args.dsd_endpoint.ipaddr_v4) != 1) {
-			vty_out(vty, "%% Bad IPv4 address\n");
-			return CMD_WARNING_CONFIG_FAILED;
-		}
+	mup_dsd_args_from_policy(bgp, afi, ep, &args, &rt, &mup_ec, &ecom);
+	if (!ecom)
+		goto done;
+
+	(void)bgp_mup_originate_dsd(bgp, &args, withdraw);
+	if (!withdraw) {
+		char *rt_str = ecommunity_ecom2str(rt, ECOMMUNITY_FORMAT_ROUTE_MAP,
+						   ECOMMUNITY_ROUTE_TARGET);
+
+		bgp_mup_origin_persist(bgp, &args, rt_str, ep->dsd_mup_str);
+		XFREE(MTYPE_ECOMMUNITY_STR, rt_str);
 	} else {
-		args.afi = AFI_IP6;
-		args.dsd_endpoint.ipa_type = IPADDR_V6;
-		if (inet_pton(AF_INET6, v6_addr_str, &args.dsd_endpoint.ipaddr_v6) != 1) {
-			vty_out(vty, "%% Bad IPv6 address\n");
-			return CMD_WARNING_CONFIG_FAILED;
-		}
+		bgp_mup_origin_forget(bgp, args.afi, &args.prd, &args.dsd_endpoint);
 	}
 
-	idx = mup_route_common_args(vty, rd_str, rt_str, &args.prd, &rt);
-	if (idx != CMD_SUCCESS)
-		return idx;
-
-	bcode = mup_dsd_behavior_keyword2code(behavior);
-	if (bcode == 0) {
-		vty_out(vty, "%% Unknown DSD behavior \"%s\"\n", behavior);
+done:
+	if (rt)
 		ecommunity_free(&rt);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-	args.dsd_behavior = bcode;
+	if (mup_ec)
+		ecommunity_free(&mup_ec);
+	if (ecom)
+		ecommunity_free(&ecom);
+}
 
-	mup_ec = bgp_mup_build_mup_ec(mup_str);
-	if (!mup_ec) {
-		vty_out(vty, "%% Malformed MUP segment identifier \"%s\"\n", mup_str);
-		ecommunity_free(&rt);
-		return CMD_WARNING_CONFIG_FAILED;
-	}
+static void mup_dsd_prechange(afi_t afi, struct bgp *bgp)
+{
+	mup_dsd_emit_singleton(bgp, afi, true);
+}
 
-	ecom = ecommunity_merge(ecommunity_dup(rt), mup_ec);
-	args.ecom = ecom;
+static void mup_dsd_postchange(afi_t afi, struct bgp *bgp)
+{
+	mup_dsd_emit_singleton(bgp, afi, false);
+}
 
-	if (sid_explicit_str) {
-		args.has_explicit_sid = true;
-		args.explicit_sid = sid_explicit;
-	}
+/* Schedule a coalesced T1ST/T2ST reannounce on every bgp instance that
+ * holds an MUP RIB; called when receive-side import RT changes so
+ * already-received NLRIs re-evaluate their per-vrf install selection.
+ */
+static void mup_st_resolve_reannounce_all(afi_t afi)
+{
+	struct listnode *node;
+	struct bgp *b;
 
-	rv = bgp_mup_originate_dsd(bgp, &args, withdraw);
-	if (rv == 0) {
-		if (withdraw)
-			bgp_mup_origin_forget(bgp, args.afi, &args.prd, &args.dsd_endpoint);
-		else
-			bgp_mup_origin_persist(bgp, &args, rt_str, mup_str);
-	}
-
-	ecommunity_free(&rt);
-	ecommunity_free(&mup_ec);
-	ecommunity_free(&ecom);
-	return rv ? CMD_WARNING_CONFIG_FAILED : CMD_SUCCESS;
+	if (!bm || !bm->bgp)
+		return;
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, b))
+		bgp_mup_schedule_reannounce_st_routes(b, afi);
 }
 
 /* L3VPN-style export-policy DEFPYs.  Live under `address-family ipv[46]
@@ -3916,19 +3960,39 @@ ALIAS (af_rd_mup_export,
        "Between current address-family and BGP-MUP\n"
        "For routes leaked from current unicast address-family to MUP\n")
 
-DEFPY (af_rt_mup_export,
-       af_rt_mup_export_cmd,
-       "[no] rt mup export RTLIST...",
+static int mup_policy_getdirs(struct vty *vty, const char *dstr, int *dodir)
+{
+	if (!strcmp(dstr, "import")) {
+		dodir[BGP_MUP_POLICY_DIR_FROMMUP] = 1;
+	} else if (!strcmp(dstr, "export")) {
+		dodir[BGP_MUP_POLICY_DIR_TOMUP] = 1;
+	} else if (!strcmp(dstr, "both")) {
+		dodir[BGP_MUP_POLICY_DIR_FROMMUP] = 1;
+		dodir[BGP_MUP_POLICY_DIR_TOMUP] = 1;
+	} else {
+		vty_out(vty, "%% direction parse error\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+	return CMD_SUCCESS;
+}
+
+DEFPY (af_rt_mup,
+       af_rt_mup_cmd,
+       "[no] rt mup <import|export|both>$direction_str RTLIST...",
        NO_STR
        "Specify route target list\n"
        "Between current address-family and BGP-MUP\n"
-       "For routes leaked from current unicast address-family to MUP\n"
+       "For routes leaked from BGP-MUP into current unicast address-family: match any\n"
+       "For routes leaked from current unicast address-family to BGP-MUP: set\n"
+       "both import: match any and export: set\n"
        "Space separated route target list (A.B.C.D:MN|EF:OPQR|GHJK:MN)\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
 	afi_t afi = bgp_mup_export_node2afi(vty);
 	struct ecommunity *ecom = NULL;
 	struct bgp_mup_export_policy *ep;
+	int dodir[BGP_MUP_POLICY_DIR_MAX] = {};
+	enum bgp_mup_policy_dir dir;
 	int idx = 0;
 	bool yes = true;
 	int ret;
@@ -3938,6 +4002,10 @@ DEFPY (af_rt_mup_export,
 		yes = false;
 
 	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	ret = mup_policy_getdirs(vty, direction_str, dodir);
 	if (ret != CMD_SUCCESS)
 		return ret;
 
@@ -3965,24 +4033,47 @@ DEFPY (af_rt_mup_export,
 		}
 	}
 
-	mup_leak_prechange(afi, bgp);
+	for (dir = 0; dir < BGP_MUP_POLICY_DIR_MAX; ++dir) {
+		if (!dodir[dir])
+			continue;
 
-	ep = bgp_mup_export_get(bgp, afi);
-	if (ep->tovpn_rtlist)
-		ecommunity_free(&ep->tovpn_rtlist);
-	ep->tovpn_rtlist = ecom; /* ecom may be NULL on `no` */
+		/* Export side: prechange withdraws leaked ISDs/DSDs so the
+		 * postchange re-emits them with the new RT list.  Import side:
+		 * trigger a coalesced T1ST/T2ST reannounce since the per-vrf
+		 * install-vrf selection key changed.
+		 */
+		if (dir == BGP_MUP_POLICY_DIR_TOMUP) {
+			mup_leak_prechange(afi, bgp);
+			mup_dsd_prechange(afi, bgp);
+		}
 
-	mup_leak_postchange(afi, bgp);
+		ep = bgp_mup_export_get(bgp, afi);
+		if (ep->rtlist[dir])
+			ecommunity_free(&ep->rtlist[dir]);
+		ep->rtlist[dir] = ecom ? ecommunity_dup(ecom) : NULL;
+
+		if (dir == BGP_MUP_POLICY_DIR_TOMUP) {
+			mup_dsd_postchange(afi, bgp);
+			mup_leak_postchange(afi, bgp);
+		} else {
+			mup_st_resolve_reannounce_all(afi);
+		}
+	}
+
+	if (ecom)
+		ecommunity_free(&ecom);
 	return CMD_SUCCESS;
 }
 
-ALIAS (af_rt_mup_export,
-       af_no_rt_mup_export_cmd,
-       "no rt mup export",
+ALIAS (af_rt_mup,
+       af_no_rt_mup_cmd,
+       "no rt mup <import|export|both>$direction_str",
        NO_STR
        "Specify route target list\n"
        "Between current address-family and BGP-MUP\n"
-       "For routes leaked from current unicast address-family to MUP\n")
+       "For routes leaked from BGP-MUP into current unicast address-family\n"
+       "For routes leaked from current unicast address-family to BGP-MUP\n"
+       "both import and export\n")
 
 DEFPY (af_sid_mup_export,
        af_sid_mup_export_cmd,
@@ -4154,13 +4245,15 @@ ALIAS (af_sid_mup_export,
        "Between current address-family and BGP-MUP\n"
        "For routes leaked from current unicast address-family to MUP\n")
 
-/* Emit the per-(vrf, afi) export-policy lines under
+/* Emit the per-(vrf, afi) MUP-policy lines under
  * `address-family ipv[46] unicast`.  Sibling of L3VPN's
- * `rd vpn export` / `rt vpn export` / `sid vpn export` writeback.
+ * `rd vpn export` / `rt vpn <import|export|both>` / `sid vpn export`
+ * writeback in bgp_vpn_policy_config_write_afi.
  */
 void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, int indent)
 {
 	struct bgp_mup_export_policy *ep;
+	struct ecommunity *rt_in, *rt_out;
 
 	if (afi != AFI_IP && afi != AFI_IP6)
 		return;
@@ -4171,12 +4264,31 @@ void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, in
 	if (ep->flags & BGP_MUP_EXPORT_RD_SET && ep->tovpn_rd_pretty)
 		vty_out(vty, "%*srd mup export %s\n", indent, "", ep->tovpn_rd_pretty);
 
-	if (ep->tovpn_rtlist) {
-		char *b = ecommunity_ecom2str(ep->tovpn_rtlist, ECOMMUNITY_FORMAT_ROUTE_MAP,
+	rt_in = ep->rtlist[BGP_MUP_POLICY_DIR_FROMMUP];
+	rt_out = ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP];
+	if (rt_in && rt_out && ecommunity_cmp(rt_in, rt_out)) {
+		char *b = ecommunity_ecom2str(rt_in, ECOMMUNITY_FORMAT_ROUTE_MAP,
 					      ECOMMUNITY_ROUTE_TARGET);
 
-		vty_out(vty, "%*srt mup export %s\n", indent, "", b);
+		vty_out(vty, "%*srt mup both %s\n", indent, "", b);
 		XFREE(MTYPE_ECOMMUNITY_STR, b);
+	} else {
+		if (rt_in) {
+			char *b = ecommunity_ecom2str(rt_in,
+						      ECOMMUNITY_FORMAT_ROUTE_MAP,
+						      ECOMMUNITY_ROUTE_TARGET);
+
+			vty_out(vty, "%*srt mup import %s\n", indent, "", b);
+			XFREE(MTYPE_ECOMMUNITY_STR, b);
+		}
+		if (rt_out) {
+			char *b = ecommunity_ecom2str(rt_out,
+						      ECOMMUNITY_FORMAT_ROUTE_MAP,
+						      ECOMMUNITY_ROUTE_TARGET);
+
+			vty_out(vty, "%*srt mup export %s\n", indent, "", b);
+			XFREE(MTYPE_ECOMMUNITY_STR, b);
+		}
 	}
 
 	if (ep->flags & BGP_MUP_EXPORT_SID_AUTO) {
@@ -4203,53 +4315,40 @@ void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, in
 				&ep->tovpn_nexthop);
 		}
 	}
+
+	if (ep->flags & BGP_MUP_EXPORT_SEGMENT_INTERWORK)
+		vty_out(vty, "%*ssegment mup export interwork\n", indent, "");
+
+	if (ep->flags & BGP_MUP_EXPORT_SEGMENT_DIRECT) {
+		if (ep->flags & BGP_MUP_EXPORT_DSD_ADDRESS_SET &&
+		    ep->dsd_address.ipa_type == IPADDR_V4)
+			vty_out(vty, "%*ssegment mup export direct address %pI4\n",
+				indent, "", &ep->dsd_address.ipaddr_v4);
+		else
+			vty_out(vty, "%*ssegment mup export direct\n", indent, "");
+	}
+
+	if (ep->dsd_behavior) {
+		const char *bkw = mup_dsd_behavior_code2keyword(ep->dsd_behavior);
+
+		if (bkw)
+			vty_out(vty, "%*sbehavior mup export %s\n", indent, "", bkw);
+	}
+
+	if (ep->dsd_mup_str)
+		vty_out(vty, "%*sext-community mup export %s\n", indent, "",
+			ep->dsd_mup_str);
 }
 
-/* Emit the persisted `segment ...` lines for a given AFI under
- * `address-family ipv4|ipv6 mup`.  Called from bgp_vty.c.
+/* No `address-family ipv[46] mup`-only writeback: all VRF-local MUP
+ * policy now lives under unicast AF (refactor 210805).  The MUP AF
+ * remains as the SAFI-global container for `neighbor activate` and
+ * future retain/show knobs.
  */
 void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi)
 {
-	struct bgp_mup_origin *o;
-	char rd_buf[RD_ADDRSTRLEN];
-
 	if (!CHECK_FLAG(bgp->af_flags[afi][SAFI_MUP], BGP_VPNVX_RETAIN_ROUTE_TARGET_ALL))
 		vty_out(vty, "  no bgp retain route-target all\n");
-
-	if (bgp->mup_import_rtlist[afi]) {
-		char *b = ecommunity_ecom2str(bgp->mup_import_rtlist[afi],
-					      ECOMMUNITY_FORMAT_ROUTE_MAP,
-					      ECOMMUNITY_ROUTE_TARGET);
-
-		vty_out(vty, "  route-target import %s\n", b);
-		XFREE(MTYPE_ECOMMUNITY_STR, b);
-	}
-
-	if (!bgp_mup_state_origins(bgp))
-		return;
-
-	frr_each (bgp_mup_origin_list, bgp_mup_state_origins(bgp), o) {
-		const char *bkw;
-
-		if (o->afi != afi)
-			continue;
-
-		prefix_rd2str(&o->prd, rd_buf, sizeof(rd_buf), bgp->asnotation);
-
-		bkw = mup_dsd_behavior_code2keyword(o->dsd_behavior);
-		if (!bkw)
-			continue; /* defensive: unknown behavior */
-		if (o->dsd_endpoint.ipa_type == IPADDR_V4)
-			vty_out(vty, "  segment direct %pI4 rd %s rt %s mup %s behavior %s",
-				&o->dsd_endpoint.ipaddr_v4, rd_buf, o->rt_str, o->mup_str, bkw);
-		else
-			vty_out(vty, "  segment direct %pI6 rd %s rt %s mup %s behavior %s",
-				&o->dsd_endpoint.ipaddr_v6, rd_buf, o->rt_str, o->mup_str, bkw);
-
-		if (o->has_explicit_sid)
-			vty_out(vty, " sid explicit %pI6", &o->explicit_sid);
-		vty_out(vty, "\n");
-	}
 }
 
 /* Replay one persisted origin against the SID manager.  Used after a
@@ -4316,11 +4415,16 @@ void bgp_mup_replay_origins_all(void)
 		for (afi = AFI_IP; afi < AFI_MAX; afi++) {
 			struct bgp_mup_export_policy *ep = bgp_mup_export_peek(bgp, afi);
 
-			if (!ep || !(ep->flags & BGP_MUP_EXPORT_RD_SET) || !ep->tovpn_rtlist)
+			if (!ep || !(ep->flags & BGP_MUP_EXPORT_RD_SET) ||
+			    !ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP])
 				continue;
-			if (ep->tovpn_sid_ready)
-				continue;
-			mup_ensure_export_sid(bgp, afi, ep);
+			if (!ep->tovpn_sid_ready)
+				mup_ensure_export_sid(bgp, afi, ep);
+			/* Replay DSD scalar singleton if the policy now has
+			 * everything it needs and a SID is ready.
+			 */
+			if (mup_dsd_policy_ready(ep) && ep->tovpn_sid_ready)
+				mup_dsd_emit_singleton(bgp, afi, false);
 		}
 
 		if (!any_locator)
@@ -4437,130 +4541,226 @@ invalidate:
 		bgp_mup_schedule_reannounce_st_routes(bgp, AFI_IP6);
 }
 
-/* `route-target import RTLIST` under `address-family ipv[46] mup` —
- * BGP-MUP analogue of L3VPN's `route-target vpn import RTLIST`
- * (af_rt_vpn_imexport_cmd in bgp_vty.c).  Stored on the per-vrf bgp
- * instance and consulted by bgp_mup_match_install_vrf and the
- * ISD/DSD cache upsert paths.  Pure receive-only PEs (e.g. a MUP-PE
- * that never originates ISD/DSD, only receives T1ST/T2ST from a
- * MUP-Controller) need this to declare which RTs map into the local
- * vrf table — the previous implementation conflated import with the
- * `segment` line's export RT and broke this case.  Mirrors L3VPN
- * structurally per memory/feedback_bgp_mup_l3vpn_reference.md.
+/* `segment mup export <direct|interwork> [address A.B.C.D]` under
+ * `address-family ipv[46] unicast`.  Master enable for ISD or DSD
+ * origination; the optional `address` override is valid only for
+ * `direct` (the DSD NLRI's Address per draft-ietf-bess-mup-safi
+ * Section 3.1.2; default = bgp router-id).  Mirrors L3VPN's pattern
+ * of placing every leak knob under unicast (`rd vpn export`,
+ * `rt vpn export`, `sid vpn export`).
  */
-DEFPY(bgp_mup_route_target_import,
-      bgp_mup_route_target_import_cmd,
-      "[no] <rt|route-target> import RTLIST...",
+DEFPY(af_segment_mup_export,
+      af_segment_mup_export_cmd,
+      "[no] segment mup export <direct$direct|interwork$interwork> [address A.B.C.D$address]",
       NO_STR
-      "Specify route target list\n"
-      "Specify route target list\n"
-      "For BGP-MUP routes received in the default-vrf MUP RIB and imported into this vrf\n"
-      "Space separated route target list (A.B.C.D:MN|EF:OPQR|GHJK:MN)\n")
+      "BGP-MUP segment to originate\n"
+      "Between current address-family and BGP-MUP\n"
+      "Origination from the current unicast address-family into BGP-MUP\n"
+      "Direct Segment Discovery (single-NLRI per (vrf, afi); draft Section 3.1.2)\n"
+      "Interwork Segment Discovery (per-prefix from this VRF unicast RIB; draft Section 3.1.1)\n"
+      "Override the DSD originating-speaker address (default = bgp router-id)\n"
+      "IPv4 address overriding bgp router-id\n")
 {
 	VTY_DECLVAR_CONTEXT(bgp, bgp);
-	struct ecommunity *ecom = NULL;
-	afi_t afi;
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
 	int idx = 0;
 	bool yes = true;
-	int i;
+	int ret;
 
 	if (argv_find(argv, argc, "no", &idx))
 		yes = false;
 
-	if (vty->node == BGP_IPV4_MUP_NODE) {
-		afi = AFI_IP;
-	} else if (vty->node == BGP_IPV6_MUP_NODE) {
-		afi = AFI_IP6;
-	} else {
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	if (interwork && address_str) {
 		vty_out(vty,
-			"%% context error: only valid in `address-family ipv[46] mup`\n");
+			"%% `address` is only valid with `segment mup export direct` (interwork uses the VRF unicast RIB)\n");
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	if (bgp->vrf_id == VRF_DEFAULT) {
-		vty_out(vty,
-			"%% route-target import must be configured under a non-default vrf bgp instance (`router bgp ASN vrf NAME`); the default-vrf instance only carries the BGP-MUP session\n");
-		return CMD_WARNING_CONFIG_FAILED;
-	}
-
-	if (yes) {
-		if (!argv_find(argv, argc, "RTLIST", &idx)) {
-			vty_out(vty, "%% Missing RTLIST\n");
-			return CMD_WARNING_CONFIG_FAILED;
-		}
-		for (i = idx; i < argc; ++i) {
-			struct ecommunity *e = ecommunity_str2com(argv[i]->arg,
-								  ECOMMUNITY_ROUTE_TARGET,
-								  0);
-
-			if (!e) {
-				vty_out(vty, "%% Malformed RT '%s'\n",
-					argv[i]->arg);
-				if (ecom)
-					ecommunity_free(&ecom);
-				return CMD_WARNING_CONFIG_FAILED;
-			}
-			if (ecom) {
-				ecommunity_merge(ecom, e);
-				ecommunity_free(&e);
+	if (direct) {
+		mup_dsd_prechange(afi, bgp);
+		ep = bgp_mup_export_get(bgp, afi);
+		if (yes) {
+			ep->flags |= BGP_MUP_EXPORT_SEGMENT_DIRECT;
+			if (address_str) {
+				ep->dsd_address.ipa_type = IPADDR_V4;
+				ep->dsd_address.ipaddr_v4 = address;
+				ep->flags |= BGP_MUP_EXPORT_DSD_ADDRESS_SET;
 			} else {
-				ecom = e;
+				ep->flags &= ~BGP_MUP_EXPORT_DSD_ADDRESS_SET;
+				memset(&ep->dsd_address, 0, sizeof(ep->dsd_address));
 			}
+		} else {
+			ep->flags &= ~(BGP_MUP_EXPORT_SEGMENT_DIRECT |
+				       BGP_MUP_EXPORT_DSD_ADDRESS_SET);
+			memset(&ep->dsd_address, 0, sizeof(ep->dsd_address));
 		}
+		mup_dsd_postchange(afi, bgp);
+	} else { /* interwork */
+		mup_leak_prechange(afi, bgp);
+		ep = bgp_mup_export_get(bgp, afi);
+		if (yes)
+			ep->flags |= BGP_MUP_EXPORT_SEGMENT_INTERWORK;
+		else
+			ep->flags &= ~BGP_MUP_EXPORT_SEGMENT_INTERWORK;
+		mup_leak_postchange(afi, bgp);
 	}
-
-	if (bgp->mup_import_rtlist[afi])
-		ecommunity_free(&bgp->mup_import_rtlist[afi]);
-	bgp->mup_import_rtlist[afi] = ecom; /* may be NULL on `no` */
-
-	/* T1ST/T2ST already in the default-vrf MUP RIB may now resolve to
-	 * (or away from) this vrf.  Schedule a coalesced reannounce on
-	 * every bgp instance that holds an MUP RIB so post-config
-	 * resolution catches up without bouncing the session.
-	 */
-	{
-		struct listnode *node;
-		struct bgp *b;
-
-		for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, b))
-			bgp_mup_schedule_reannounce_st_routes(b, afi);
-	}
-
 	return CMD_SUCCESS;
 }
 
-ALIAS(bgp_mup_route_target_import,
-      bgp_mup_no_route_target_import_cmd,
-      "no <rt|route-target> import",
+/* `behavior mup export <dt4|dt6|dt46>` under unicast AF — picks the
+ * DSD prefix-SID's End.DT* function.  Per draft-ietf-bess-mup-safi
+ * Section 3.3.4 the function reflects the inner PDU lookup AFI (PDU
+ * session type), independent of the DSD's Address AFI; the operator
+ * MUST declare it explicitly.
+ */
+DEFPY(af_behavior_mup_export,
+      af_behavior_mup_export_cmd,
+      "[no] behavior mup export <dt4$dt4|dt6$dt6|dt46$dt46>",
       NO_STR
-      "Specify route target list\n"
-      "Specify route target list\n"
-      "For BGP-MUP routes received in the default-vrf MUP RIB and imported into this vrf\n")
+      "SRv6 endpoint behavior\n"
+      "Between current address-family and BGP-MUP\n"
+      "For DSD prefix-SID emitted by current unicast address-family into BGP-MUP\n"
+      "End.DT4 — decap and lookup in the IPv4 table\n"
+      "End.DT6 — decap and lookup in the IPv6 table\n"
+      "End.DT46 — decap and lookup in either IPv4 or IPv6 table\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int idx = 0;
+	bool yes = true;
+	int ret;
+
+	if (argv_find(argv, argc, "no", &idx))
+		yes = false;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	mup_dsd_prechange(afi, bgp);
+	ep = bgp_mup_export_get(bgp, afi);
+	if (yes) {
+		if (dt4)
+			ep->dsd_behavior = SRV6_ENDPOINT_BEHAVIOR_END_DT4;
+		else if (dt6)
+			ep->dsd_behavior = SRV6_ENDPOINT_BEHAVIOR_END_DT6;
+		else if (dt46)
+			ep->dsd_behavior = SRV6_ENDPOINT_BEHAVIOR_END_DT46;
+	} else {
+		ep->dsd_behavior = 0;
+	}
+	mup_dsd_postchange(afi, bgp);
+	return CMD_SUCCESS;
+}
+
+ALIAS(af_behavior_mup_export,
+      af_no_behavior_mup_export_cmd,
+      "no behavior mup export",
+      NO_STR
+      "SRv6 endpoint behavior\n"
+      "Between current address-family and BGP-MUP\n"
+      "For DSD prefix-SID emitted by current unicast address-family into BGP-MUP\n")
+
+/* `ext-community mup export ASN:NN` under unicast AF — sets the MUP
+ * Direct-Type Segment Identifier extended community (draft Section 4.2)
+ * carried on every DSD originated from this (vrf, afi).
+ */
+DEFPY(af_ext_community_mup_export,
+      af_ext_community_mup_export_cmd,
+      "[no] ext-community mup export ASN:NN$ec_str",
+      NO_STR
+      "MUP Extended Community\n"
+      "Between current address-family and BGP-MUP\n"
+      "For DSD originated from current unicast address-family into BGP-MUP\n"
+      "MUP segment identifier (ASN:NN)\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int idx = 0;
+	bool yes = true;
+	int ret;
+
+	if (argv_find(argv, argc, "no", &idx))
+		yes = false;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	if (yes) {
+		uint16_t mup_as = 0;
+		uint32_t mup_val = 0;
+
+		if (!bgp_mup_parse_seg_id_str(ec_str, &mup_as, &mup_val)) {
+			vty_out(vty, "%% Malformed MUP segment identifier \"%s\"\n",
+				ec_str);
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+		mup_dsd_prechange(afi, bgp);
+		ep = bgp_mup_export_get(bgp, afi);
+		XFREE(MTYPE_BGP_MUP_STR, ep->dsd_mup_str);
+		ep->dsd_mup_str = XSTRDUP(MTYPE_BGP_MUP_STR, ec_str);
+		ep->dsd_mup_as = mup_as;
+		ep->dsd_mup_val = mup_val;
+		mup_dsd_postchange(afi, bgp);
+	} else {
+		mup_dsd_prechange(afi, bgp);
+		ep = bgp_mup_export_get(bgp, afi);
+		XFREE(MTYPE_BGP_MUP_STR, ep->dsd_mup_str);
+		ep->dsd_mup_as = 0;
+		ep->dsd_mup_val = 0;
+		mup_dsd_postchange(afi, bgp);
+	}
+	return CMD_SUCCESS;
+}
+
+ALIAS(af_ext_community_mup_export,
+      af_no_ext_community_mup_export_cmd,
+      "no ext-community mup export",
+      NO_STR
+      "MUP Extended Community\n"
+      "Between current address-family and BGP-MUP\n"
+      "For DSD originated from current unicast address-family into BGP-MUP\n")
 
 void bgp_mup_vty_init(void)
 {
-	install_element(BGP_IPV4_MUP_NODE, &bgp_mup_segment_direct_cmd);
-	install_element(BGP_IPV4_MUP_NODE, &bgp_mup_route_target_import_cmd);
-	install_element(BGP_IPV4_MUP_NODE, &bgp_mup_no_route_target_import_cmd);
-	install_element(BGP_IPV6_MUP_NODE, &bgp_mup_segment_direct_cmd);
-	install_element(BGP_IPV6_MUP_NODE, &bgp_mup_route_target_import_cmd);
-	install_element(BGP_IPV6_MUP_NODE, &bgp_mup_no_route_target_import_cmd);
-
-	/* New L3VPN-style export-policy commands under unicast AF nodes. */
+	/* L3VPN-style leak-policy commands under unicast AF nodes — every
+	 * VRF-local MUP knob (RD/RT/SID/segment toggle/behavior/MUP-EC)
+	 * mirrors `rd vpn export` / `rt vpn <import|export|both>` /
+	 * `sid vpn export`.  See refactor issue 210805.
+	 */
 	install_element(BGP_IPV4_NODE, &af_rd_mup_export_cmd);
 	install_element(BGP_IPV4_NODE, &af_no_rd_mup_export_cmd);
-	install_element(BGP_IPV4_NODE, &af_rt_mup_export_cmd);
-	install_element(BGP_IPV4_NODE, &af_no_rt_mup_export_cmd);
+	install_element(BGP_IPV4_NODE, &af_rt_mup_cmd);
+	install_element(BGP_IPV4_NODE, &af_no_rt_mup_cmd);
 	install_element(BGP_IPV4_NODE, &af_sid_mup_export_cmd);
 	install_element(BGP_IPV4_NODE, &af_no_sid_mup_export_cmd);
 	install_element(BGP_IPV4_NODE, &af_nexthop_mup_export_cmd);
 	install_element(BGP_IPV4_NODE, &af_no_nexthop_mup_export_cmd);
+	install_element(BGP_IPV4_NODE, &af_segment_mup_export_cmd);
+	install_element(BGP_IPV4_NODE, &af_behavior_mup_export_cmd);
+	install_element(BGP_IPV4_NODE, &af_no_behavior_mup_export_cmd);
+	install_element(BGP_IPV4_NODE, &af_ext_community_mup_export_cmd);
+	install_element(BGP_IPV4_NODE, &af_no_ext_community_mup_export_cmd);
+
 	install_element(BGP_IPV6_NODE, &af_rd_mup_export_cmd);
 	install_element(BGP_IPV6_NODE, &af_no_rd_mup_export_cmd);
-	install_element(BGP_IPV6_NODE, &af_rt_mup_export_cmd);
-	install_element(BGP_IPV6_NODE, &af_no_rt_mup_export_cmd);
+	install_element(BGP_IPV6_NODE, &af_rt_mup_cmd);
+	install_element(BGP_IPV6_NODE, &af_no_rt_mup_cmd);
 	install_element(BGP_IPV6_NODE, &af_sid_mup_export_cmd);
 	install_element(BGP_IPV6_NODE, &af_no_sid_mup_export_cmd);
 	install_element(BGP_IPV6_NODE, &af_nexthop_mup_export_cmd);
 	install_element(BGP_IPV6_NODE, &af_no_nexthop_mup_export_cmd);
+	install_element(BGP_IPV6_NODE, &af_segment_mup_export_cmd);
+	install_element(BGP_IPV6_NODE, &af_behavior_mup_export_cmd);
+	install_element(BGP_IPV6_NODE, &af_no_behavior_mup_export_cmd);
+	install_element(BGP_IPV6_NODE, &af_ext_community_mup_export_cmd);
+	install_element(BGP_IPV6_NODE, &af_no_ext_community_mup_export_cmd);
 }

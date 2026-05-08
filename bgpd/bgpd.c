@@ -4751,11 +4751,6 @@ void bgp_free(struct bgp *bgp)
 	bgp_tip_hash_destroy(bgp);
 	bgp_mup_state_free(bgp);
 
-	for (afi = AFI_IP; afi < AFI_MAX; afi++) {
-		if (bgp->mup_import_rtlist[afi])
-			ecommunity_free(&bgp->mup_import_rtlist[afi]);
-	}
-
 	/* release the auto RD id */
 	bf_release_index(bm->rd_idspace, bgp->vrf_rd_id);
 

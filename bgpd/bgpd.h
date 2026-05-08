@@ -1107,28 +1107,19 @@ struct bgp {
 	 */
 	struct bgp_mup_state *mup_state;
 
-	/* BGP-MUP per-vrf-per-afi import RT list, populated by
-	 * `route-target import RTLIST` under `address-family ipv[46] mup`.
-	 * A T1ST/T2ST received in the default-vrf MUP RIB is installed in
-	 * this vrf iff one of its RTs appears here.  ISD/DSD entries are
-	 * cached only when at least one vrf imports the route's RT.
-	 * Mirrors L3VPN's vpn_policy[afi].rtlist[FROMVPN] but kept separate
-	 * so a vrf doing both L3VPN and MUP can scope import RTs per AF.
-	 */
-	struct ecommunity *mup_import_rtlist[AFI_MAX];
-
-	/* BGP-MUP per-vrf-per-afi export policy.  Mirrors L3VPN's
-	 * vpn_policy[afi] (TOVPN direction): RD, RT list, and SID
-	 * allocation knob configured once per (vrf, afi) under
-	 * `address-family ipv[46] unicast` via `rd mup export` /
-	 * `rt mup export` / `sid mup export`.  Drives ISD origination
-	 * from the unicast RIB through mup_leak_from_vrf_update() —
-	 * each N3 (gNB-side) reachability prefix in the unicast RIB
-	 * becomes one ISD NLRI carrying the policy's RD, RT list, and
-	 * the per-(vrf, afi) End.M.GTP4.E / End.M.GTP6.E SID.  Opaque
-	 * pointer to keep MUP-internal types out of bgpd.h; lazily
-	 * allocated by bgp_mup.c on first CLI mutation, freed by
-	 * bgp_mup_state_free().
+	/* BGP-MUP per-vrf-per-afi policy.  Mirrors L3VPN's vpn_policy[afi]:
+	 * RD, RT list (both directions), SID allocation knob configured
+	 * once per (vrf, afi) under `address-family ipv[46] unicast` via
+	 * `rd mup export` / `rt mup <import|export|both>` /
+	 * `sid mup export`.  Drives ISD origination from the unicast RIB
+	 * through mup_leak_from_vrf_update() — each N3 (gNB-side)
+	 * reachability prefix in the unicast RIB becomes one ISD NLRI
+	 * carrying the policy's RD, RT list, and the per-(vrf, afi)
+	 * End.M.GTP4.E / End.M.GTP6.E SID.  Receive-side, the FROMMUP
+	 * RT list selects which T1ST/T2ST the vrf installs (mirrors
+	 * vpn_policy[afi].rtlist[FROMVPN]).  Opaque pointer to keep
+	 * MUP-internal types out of bgpd.h; lazily allocated by
+	 * bgp_mup.c on first CLI mutation, freed by bgp_mup_state_free().
 	 */
 	struct bgp_mup_export_policy *mup_export[AFI_MAX];
 

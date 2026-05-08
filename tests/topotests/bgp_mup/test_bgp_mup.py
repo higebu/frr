@@ -95,11 +95,15 @@ def build_topo(tgen):
     tgen.gears["r1"].run("ip link set lo-slice1 up")
 
     # r2 is the receive-only PE: it never originates ISD/DSD, but it
-    # still needs a per-vrf bgp instance to declare a `route-target
-    # import` for the T1ST/T2ST received from peer1.  bgpd refuses
-    # `router bgp ASN vrf slice1` if the netdev doesn't exist.
-    tgen.gears["r2"].run("ip link add slice1 type vrf table 100")
-    tgen.gears["r2"].run("ip link set slice1 up")
+    # still needs per-vrf bgp instances to declare `rt mup import`
+    # values for the T1ST/T2ST received from peer1.  bgpd refuses
+    # `router bgp ASN vrf NAME` if the netdev doesn't exist.  Two
+    # slices verify per-(vrf, afi) install-vrf selection on receive.
+    for slice_name, slice_table in (("slice1", 100), ("slice2", 101)):
+        tgen.gears["r2"].run("ip link add {} type vrf table {}".format(
+            slice_name, slice_table
+        ))
+        tgen.gears["r2"].run("ip link set {} up".format(slice_name))
 
 
 def setup_module(mod):
@@ -196,9 +200,10 @@ def _grep(router, command, pattern):
 
 
 def test_isd_dsd_originated_on_r1():
-    """r1 must have its ISD(v4)+two DSD(v4) (one per RT)+ISD(v6) routes
-    in the local RIB.  The second DSD (RT 65001:2) drives the
-    multi-RT import-filter test on r2."""
+    """r1 must have its ISD(v4)+DSD(v4)+ISD(v6) routes in the local
+    RIB.  Per refactor 210805, DSD is a single per-(vrf, afi) NLRI;
+    a second DSD with a different RT is no longer expressible at the
+    single (slice1, AFI_IP) policy."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -208,8 +213,7 @@ def test_isd_dsd_originated_on_r1():
 
     expectations = [
         ("show bgp ipv4 mup all", "10.99.0.0/24", "ISD(v4)"),
-        ("show bgp ipv4 mup all", "10.0.0.250", "DSD(v4) RT 65001:1"),
-        ("show bgp ipv4 mup all", "10.0.0.251", "DSD(v4) RT 65001:2"),
+        ("show bgp ipv4 mup all", "10.0.0.250", "DSD(v4)"),
         ("show bgp ipv6 mup all", "2001:db8:99::/64", "ISD(v6)"),
     ]
     for cmd, pat, label in expectations:
@@ -223,7 +227,7 @@ def test_isd_dsd_originated_on_r1():
 
 
 def test_isd_dsd_propagated_to_r2():
-    """All four originated routes must arrive at r2 over BGP-MUP."""
+    """All originated routes must arrive at r2 over BGP-MUP."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -233,8 +237,7 @@ def test_isd_dsd_propagated_to_r2():
 
     expectations = [
         ("show bgp ipv4 mup all", "10.99.0.0/24", "ISD(v4)"),
-        ("show bgp ipv4 mup all", "10.0.0.250", "DSD(v4) RT 65001:1"),
-        ("show bgp ipv4 mup all", "10.0.0.251", "DSD(v4) RT 65001:2"),
+        ("show bgp ipv4 mup all", "10.0.0.250", "DSD(v4)"),
         ("show bgp ipv6 mup all", "2001:db8:99::/64", "ISD(v6)"),
     ]
     for cmd, pat, label in expectations:
@@ -272,15 +275,15 @@ def test_prefix_sid_structure_propagated():
 
 
 def test_export_and_segment_lines_in_running_config():
-    """`show running-config` on r1 must emit the operator's MUP
-    export-policy lines (under unicast AF, via
-    bgp_mup_export_config_write) and the DSD `segment direct` line
-    (under MUP AF, via bgp_mup_config_write_af).
+    """`show running-config` on r1 must emit the new L3VPN-style MUP
+    policy lines under unicast AF (rd|rt|sid mup export, segment mup
+    export <interwork|direct>, behavior mup export, ext-community mup
+    export).
 
     The IPv6 unicast AF uses the per-policy `locator loc-mup-v6`
     override, so the `sid mup export auto locator loc-mup-v6` form
-    must round-trip too — separate from the IPv4 unicast AF's
-    plain `sid mup export auto`.
+    must round-trip too — separate from the IPv4 unicast AF's plain
+    `sid mup export auto`.
     """
     tgen = get_topogen()
     if tgen.routers_have_failure():
@@ -295,7 +298,10 @@ def test_export_and_segment_lines_in_running_config():
         "rt mup export 65001:2",
         "sid mup export auto",
         "sid mup export auto locator loc-mup-v6",
-        "segment direct 10.0.0.250 rd 100:100 rt 65001:1 mup 65001:10 behavior dt4",
+        "segment mup export interwork",
+        "segment mup export direct address 10.0.0.250",
+        "behavior mup export dt4",
+        "ext-community mup export 65001:10",
     ]
     for line in expected_lines:
         assert line in output, (
@@ -481,50 +487,45 @@ def test_t2st_skipped_without_dsd():
     )
 
 
-def test_t2st_filtered_by_import_rt():
-    """T2ST 10.0.0.251 carries RT 65001:2 (and matches r1's second
-    DSD with mup 65001:11), so resolution against the DSD cache
-    succeeds — but r2's slice1 vrf imports only RT 65001:1, so the
-    install-vrf selection must return VRF_UNKNOWN and no FIB entry
-    should appear in slice1.
-
-    This is the negative side of the per-vrf import-RT filter:
-    confirms that an explicitly-set import list rejects routes whose
-    RTs are not in it, even when DSD/T1ST resolution itself would
-    otherwise succeed.  Mirrors L3VPN's
-    vpn_leak_to_vrf_update_onevrf RT-mismatch path."""
+def test_t2st_install_vrf_selected_by_import_rt():
+    """Two-VRF receive-side selection regression:
+    r2 carries slice1 (rt mup import 65001:1) and slice2
+    (rt mup import 65001:2).  The T2ST 10.0.0.250 from peer1 carries
+    RT 65001:1, so it must install only in slice1 — never in slice2,
+    never in the default vrf.  Mirrors L3VPN's
+    vpn_leak_to_vrf_update_onevrf rtlist[FROMVPN] match per
+    bgp_mplsvpn.c."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
 
     r2 = tgen.gears["r2"]
 
-    # Confirm the T2ST is selectable in r2's default-vrf MUP RIB —
-    # filter rejection happens at the install-vrf step, not at the
-    # BGP RIB level.
+    # slice1 install: RT-1 matches.
     _wait_for(
         r2,
         lambda r: None
-        if _grep(r, "show bgp ipv4 mup all", "10.0.0.251")
-        else "expected T2ST 10.0.0.251 in r2's MUP RIB",
-        "T2ST 10.0.0.251 selectable in MUP RIB",
+        if _route_via_bgp(r, "10.0.0.250/32", vrf="slice1")
+        else "expected T2ST 10.0.0.250/32 in vrf slice1",
+        "T2ST 10.0.0.250/32 in slice1",
     )
 
-    # Allow the resolution + install-vrf path to run.
+    # slice2 must not see it — RT-1 is not in slice2's import list.
     time.sleep(5)
-    assert not _route_via_bgp(r2, "10.0.0.251/32", vrf="slice1"), (
-        "T2ST RT 65001:2 must not install in slice1 (slice1 only "
-        "imports 65001:1)"
+    assert not _route_via_bgp(r2, "10.0.0.250/32", vrf="slice2"), (
+        "T2ST RT 65001:1 must not install in slice2 (slice2 only "
+        "imports 65001:2)"
     )
-    assert not _route_via_bgp(r2, "10.0.0.251/32"), (
-        "T2ST RT 65001:2 must not install in default vrf either"
+    assert not _route_via_bgp(r2, "10.0.0.250/32"), (
+        "T2ST must not install in default vrf"
     )
 
 
 def test_no_segment_removes_route():
-    """`no segment ...` must withdraw the route from both r1 and r2 RIBs,
-    drop the line from running-config, AND cause r2 to remove the
-    matching T2ST FIB route once the DSD cache loses its entry."""
+    """`no segment mup export direct` must withdraw the DSD from both
+    r1 and r2 RIBs, drop the line from running-config, AND cause r2 to
+    remove the matching T2ST FIB route once the DSD cache loses its
+    entry."""
     tgen = get_topogen()
     if tgen.routers_have_failure():
         pytest.skip(tgen.errors)
@@ -535,8 +536,8 @@ def test_no_segment_removes_route():
     r1.vtysh_cmd(
         "configure terminal\n"
         "router bgp 65001 vrf slice1\n"
-        " address-family ipv4 mup\n"
-        "  no segment direct 10.0.0.250 rd 100:100 rt 65001:1 mup 65001:10 behavior dt4\n"
+        " address-family ipv4 unicast\n"
+        "  no segment mup export direct\n"
         " exit-address-family\n"
         "exit\n"
     )
@@ -569,8 +570,8 @@ def test_no_segment_removes_route():
     )
 
     output = r1.vtysh_cmd("show running-config")
-    assert "segment direct 10.0.0.250" not in output, (
-        "running-config still contains the withdrawn DSD line"
+    assert "segment mup export direct" not in output, (
+        "running-config still contains the withdrawn DSD enable line"
     )
 
 
