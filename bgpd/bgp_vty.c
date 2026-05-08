@@ -51,6 +51,7 @@
 #include "bgpd/bgp_regex.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_vty.h"
@@ -64,7 +65,6 @@
 #include "bgpd/bgp_evpn_mh.h"
 #include "bgpd/bgp_addpath.h"
 #include "bgpd/bgp_mac.h"
-#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
@@ -11708,11 +11708,11 @@ DEFUN_NOSH (address_family_ipv4_safi,
 	if (argc == 3) {
 		VTY_DECLVAR_CONTEXT(bgp, bgp);
 		safi_t safi = bgp_vty_safi_from_str(argv[2]->text);
-		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT
-		    && safi != SAFI_UNICAST && safi != SAFI_MULTICAST
-		    && safi != SAFI_EVPN) {
+		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT &&
+		    safi != SAFI_UNICAST && safi != SAFI_MULTICAST &&
+		    safi != SAFI_EVPN && safi != SAFI_MUP) {
 			vty_out(vty,
-				"Only Unicast/Multicast/EVPN SAFIs supported in non-core instances.\n");
+				"Only Unicast/Multicast/EVPN/MUP SAFIs supported in non-core instances.\n");
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		vty->node = bgp_node_type(AFI_IP, safi);
@@ -11732,11 +11732,11 @@ DEFUN_NOSH (address_family_ipv6_safi,
 	if (argc == 3) {
 		VTY_DECLVAR_CONTEXT(bgp, bgp);
 		safi_t safi = bgp_vty_safi_from_str(argv[2]->text);
-		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT
-		    && safi != SAFI_UNICAST && safi != SAFI_MULTICAST
-		    && safi != SAFI_EVPN) {
+		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT &&
+		    safi != SAFI_UNICAST && safi != SAFI_MULTICAST &&
+		    safi != SAFI_EVPN && safi != SAFI_MUP) {
 			vty_out(vty,
-				"Only Unicast/Multicast/EVPN SAFIs supported in non-core instances.\n");
+				"Only Unicast/Multicast/EVPN/MUP SAFIs supported in non-core instances.\n");
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		vty->node = bgp_node_type(AFI_IP6, safi);
@@ -21896,6 +21896,7 @@ static void bgp_config_write_family(struct vty *vty, struct bgp *bgp, afi_t afi,
 
 			vty_out(vty, "  import vpn\n");
 		}
+		bgp_mup_imexport_config_write(vty, bgp, afi, 2);
 		if (CHECK_FLAG(bgp->af_flags[afi][safi],
 			       BGP_CONFIG_VRF_TO_VRF_IMPORT)) {
 			char *name;
@@ -24666,6 +24667,8 @@ void bgp_vty_init(void)
 	/* BGP retain all route-target */
 	install_element(BGP_VPNV4_NODE, &bgp_retain_route_target_cmd);
 	install_element(BGP_VPNV6_NODE, &bgp_retain_route_target_cmd);
+	install_element(BGP_IPV4_MUP_NODE, &bgp_retain_route_target_cmd);
+	install_element(BGP_IPV6_MUP_NODE, &bgp_retain_route_target_cmd);
 
 	/* "clear ip bgp commands" */
 	install_element(ENABLE_NODE, &clear_ip_bgp_all_cmd);
