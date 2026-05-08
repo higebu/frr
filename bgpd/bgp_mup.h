@@ -24,6 +24,15 @@ void bgp_mup_encode_prefix(struct stream *s, afi_t afi, const struct prefix *p,
 /* Parse all BGP-MUP NLRIs in an MP_REACH/MP_UNREACH attribute. */
 int bgp_nlri_parse_mup(struct peer *peer, struct attr *attr, struct bgp_nlri *packet, int withdraw);
 
+/* Encode a BGP-MUP prefix into JSON for the `json` variants of
+ * `show bgp ipv[46] mup ...`.  Adds route-type-keyed fields (archType,
+ * routeType, length, rd, plus the per-route-type IP / TEID / QFI /
+ * endpoint payload) onto the supplied json object.  Mirrors
+ * bgp_evpn_route2json() so the output shape is recognisable to
+ * consumers already used to that family.
+ */
+void bgp_mup_route2json(const struct prefix_mup *p, json_object *json);
+
 /* Translate a selected BGP-MUP route into a zapi route programming the
  * appropriate SRv6 Mobile User Plane action in the kernel.  Returns
  * the zclient send status (ZCLIENT_SEND_SUCCESS when no kernel state
@@ -33,30 +42,169 @@ int bgp_nlri_parse_mup(struct peer *peer, struct attr *attr, struct bgp_nlri *pa
 int bgp_mup_zebra_announce(struct bgp_dest *dest, struct bgp_path_info *info, struct bgp *bgp);
 int bgp_mup_zebra_withdraw(struct bgp_dest *dest, struct bgp_path_info *info, struct bgp *bgp);
 
-/* Free the per-bgp ISD/DSD discovery caches (called from bgp_free). */
-void bgp_mup_caches_free(struct bgp *bgp);
+/* Locally originate ISD/DSD routes (FRR as MUP-PE/MUP-GW per
+ * draft-ietf-bess-mup-safi).  T1ST/T2ST origination is intentionally
+ * not provided: those routes carry per-session 5G state and are the
+ * responsibility of an external MUP Controller (MUP-C).
+ *
+ * The advertised SID consists of the BGP instance's configured SRv6
+ * locator + a function (RFC 8986 SID Structure).  Function allocation:
+ *
+ *   - Auto (default): bgpd asks zebra's SRv6 SID manager for a function
+ *     under the configured locator (mirrors `sid vpn export auto`).
+ *     zebra installs the local seg6local kernel state as a side-effect
+ *     of allocation.
+ *   - Explicit (`sid explicit X:X::X:X`): operator pins a specific SID
+ *     (escape hatch for inter-AS / migration scenarios).
+ *
+ * Behavior:
+ *   - ISD: MUST be End.M.GTP4.E (IPv4 AFI) / End.M.GTP6.E (IPv6 AFI)
+ *     per draft Section 3.3.1; chosen automatically by AFI.
+ *   - DSD: End.DT4 / End.DT6; operator picks via `behavior` keyword.
+ */
+struct ecommunity;
+struct ipaddr;
 
-/* Free the per-(vrf, afi) MUP export policy (called from bgp_free). */
-void bgp_mup_export_clear(struct bgp *bgp, afi_t afi);
+/* Operator-facing parameters captured from VTY; shared between the two
+ * route types so we keep the caller signature small.  See bgp_mup.c
+ * for the synchronous (sid explicit) and async (auto-allocate) paths.
+ */
+struct bgp_mup_origin_args {
+	afi_t afi;
+	struct prefix_rd prd;
+	struct ecommunity *ecom; /* RT (+ MUP for DSD); caller owns */
+	bool has_explicit_sid;
+	struct in6_addr explicit_sid; /* used iff has_explicit_sid */
+	/* Per-route-type extras */
+	struct prefix isd_prefix;   /* ISD only */
+	struct ipaddr dsd_endpoint; /* DSD only */
+	uint16_t dsd_behavior;	    /* DSD only: End.DT4 / End.DT6 */
+};
 
-/* Emit BGP-MUP per-AFI commands under `address-family ipv4|ipv6 mup`
- * (placeholder for future SAFI-global knobs).  Called from bgp_vty.c.
+int bgp_mup_originate_dsd(struct bgp *bgp, const struct bgp_mup_origin_args *args, bool withdraw);
+void bgp_mup_vty_init(void);
+
+/* Process-wide self-origin index init/finish.  Mirrors bgp_mac_init /
+ * bgp_mac_finish: bm-scoped hashes that let receive-side T1ST/T2ST
+ * resolution detect self-originated ISD/DSD in O(1).
+ */
+void bgp_mup_master_init(void);
+void bgp_mup_master_finish(void);
+
+/* Locator-arrival replay: called after zebra ships SRv6 locator chunks
+ * to bgpd, so any `segment` lines that landed before chunks were
+ * available finish their SID setup.  Same role as L3VPN's
+ * vpn_leak_postchange_all().
+ */
+void bgp_mup_replay_origins_all(void);
+
+/* Locator-delete hook: symmetric counterpart of
+ * bgp_mup_replay_origins_all().  Called from bgp_zebra.c's
+ * bgp_zebra_process_srv6_locator_delete_per_bgp() after the L3VPN
+ * cleanup so MUP drops any persisted origin's install fingerprint
+ * and OIF cache that resolved against the just-deleted locator,
+ * and schedules a coalesced T1ST/T2ST reannounce on the affected
+ * (bgp, afi).
+ */
+struct srv6_locator;
+void bgp_mup_process_srv6_locator_delete_per_bgp(struct srv6_locator *loc, struct bgp *bgp);
+
+/* Emit the per-(vrf, afi) MUP-policy lines under
+ * `address-family ipv[46] mup` — RD, RT, route-map, SID, nexthop,
+ * segment <interwork|direct>, and the `segment direct` sub-block
+ * (address / behavior / segment-id) when configured.
  */
 void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi);
 
-/* Emit per-(vrf, afi) MUP-policy lines under
- * `address-family ipv[46] unicast`.  Sibling of L3VPN's
- * `rd vpn export` / `rt vpn <import|export|both>` writeback.
+/* Free the per-bgp MUP state (origin/pending lists, ISD/DSD discovery
+ * caches, per-AFI reannounce event).  Called from bgp_free.
  */
-void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, int indent);
-
-/* Register BGP-MUP CLI commands under BGP_IPV4_MUP_NODE / BGP_IPV6_MUP_NODE. */
-void bgp_mup_vty_init(void);
+void bgp_mup_state_free(struct bgp *bgp);
 
 /* Invalidate the process-wide iface-state caches used by T1ST/T2ST
  * install (local IPv6 source, locator OIF).  Called from bgp_zebra.c
  * on every connected-address add/delete in @vrf_id.
  */
 void bgp_mup_iface_addr_change(vrf_id_t vrf_id);
+
+/* SRv6 SID manager async completion: zebra returned a SID for one of
+ * our pending originate requests.  Called from bgp_zebra.c's
+ * ZAPI_SRV6_SID_ALLOCATED handler when the ctx's behavior is one of
+ * the MUP behaviors (End.M.GTP*.E for ISD, End.DT/DX for DSD).
+ */
+struct srv6_sid_ctx;
+bool bgp_mup_handle_sid_alloc(struct bgp *bgp, const struct srv6_sid_ctx *ctx,
+			      const struct in6_addr *sid_value, const char *loc_name);
+
+/* True iff @name matches any per-(vrf, afi) MUP export-policy locator
+ * override across the bgp master list.  Used by the SRv6 locator chunk
+ * receive path so chunks for MUP-tracked locators are not dropped due
+ * to mismatch with the per-bgp primary `srv6_locator_name`.
+ */
+bool bgp_mup_locator_name_is_tracked(const char *name);
+
+/* ISD origination from the VRF SAFI_MUP RIB locally-originated entries.
+ *
+ * mup_leak_prechange / _postchange wrap state mutations to the per-
+ * (vrf, afi) policy: prechange withdraws all currently-emitted ISD NLRIs
+ * for this VRF/AFI; postchange re-emits them from the current SAFI_MUP
+ * RIB locally-originated set (BGP_ROUTE_STATIC + BGP_ROUTE_REDISTRIBUTE).
+ *
+ * mup_leak_from_vrf_update_all / _withdraw_all are the bulk variants
+ * walking the (from_bgp, afi, SAFI_MUP) RIB filtered to locally-
+ * originated entries.
+ *
+ * to_bgp is always the default-VRF instance (bgp_get_default()); the
+ * primitives are no-ops if either bgp is NULL or from_bgp is the
+ * default-VRF instance.
+ */
+struct bgp_path_info;
+void mup_leak_from_vrf_update_all(struct bgp *to_bgp, struct bgp *from_bgp, afi_t afi);
+void mup_leak_from_vrf_withdraw_all(struct bgp *to_bgp, struct bgp *from_bgp, afi_t afi);
+void mup_leak_from_vrf_withdraw(struct bgp *to_bgp, struct bgp *from_bgp,
+				struct bgp_path_info *path_vrf);
+void mup_leak_prechange(afi_t afi, struct bgp *bgp);
+void mup_leak_postchange(afi_t afi, struct bgp *bgp);
+
+/* Route-map module callback: a route-map of @rmap_name was added,
+ * deleted, or modified.  Re-resolve any bgp->mup_export[afi]->rmap[]
+ * pointers and replay the affected (vrf, afi) origination/install paths.
+ */
+void mup_policy_routemap_event(const char *rmap_name);
+
+/* Predicate-only auto-activation: TOMUP active when rd is set AND a
+ * segment selector (interwork or fully-defined direct) is configured;
+ * FROMMUP active when at least one rt import (or both) entry exists.
+ */
+bool bgp_mup_origin_active(struct bgp *bgp, afi_t afi);
+bool bgp_mup_import_active(struct bgp *bgp, afi_t afi);
+
+/* `bgp retain route-target all` filter.  Returns true iff @attr's RT
+ * extended communities match no per-VRF `route-target import` list,
+ * i.e. the NLRI should be filtered out at receive time when the
+ * default-instance MUP RIB is configured with `no bgp retain
+ * route-target all`.  Mirrors L3VPN's
+ * vpn_leak_to_vrf_no_retain_filter_check (bgpd/bgp_mplsvpn.c).
+ */
+struct attr;
+bool bgp_mup_no_retain_filter_check(struct bgp *bgp, struct attr *attr, afi_t afi);
+
+/* True iff a VRF bgp instance participates in BGP-MUP origination or
+ * receive-side install for any AFI.  Used by show output and conditional
+ * cleanup paths that need a single per-VRF "is this bgp tied to MUP?"
+ * check.
+ */
+static inline bool is_bgp_vrf_mup(struct bgp *bgp)
+{
+	afi_t afi;
+
+	if (bgp->inst_type != BGP_INSTANCE_TYPE_VRF)
+		return false;
+	for (afi = 0; afi < AFI_MAX; ++afi) {
+		if (bgp_mup_origin_active(bgp, afi) || bgp_mup_import_active(bgp, afi))
+			return true;
+	}
+	return false;
+}
 
 #endif /* _FRR_BGP_MUP_H */
