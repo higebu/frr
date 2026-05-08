@@ -3753,10 +3753,18 @@ static int bgp_zebra_process_srv6_locator_chunk(ZAPI_CALLBACK_ARGS)
 	zapi_srv6_locator_chunk_decode(s, chunk);
 
 	if (strcmp(bgp->srv6_locator_name, chunk->locator_name) != 0) {
-		flog_err(EC_BGP_SRV6_LOCATOR_MISMATCH, "%s: Locator name unmatch %s:%s", __func__,
-			 bgp->srv6_locator_name, chunk->locator_name);
-		srv6_locator_chunk_free(&chunk);
-		return 0;
+		/* Allow chunks for any per-(vrf, afi) MUP export-policy
+		 * locator override, even when it differs from the bgp's
+		 * primary `srv6_locator_name`.  L3VPN keeps the original
+		 * single-locator-per-bgp model; MUP layers per-policy
+		 * locator selection on top.
+		 */
+		if (!bgp_mup_locator_name_is_tracked(chunk->locator_name)) {
+			flog_err(EC_BGP_SRV6_LOCATOR_MISMATCH, "%s: Locator name unmatch %s:%s",
+				 __func__, bgp->srv6_locator_name, chunk->locator_name);
+			srv6_locator_chunk_free(&chunk);
+			return 0;
+		}
 	}
 
 	for (ALL_LIST_ELEMENTS_RO(bgp->srv6_locator_chunks, node, c)) {
@@ -3768,6 +3776,7 @@ static int bgp_zebra_process_srv6_locator_chunk(ZAPI_CALLBACK_ARGS)
 
 	listnode_add(bgp->srv6_locator_chunks, chunk);
 	vpn_leak_postchange_all();
+	bgp_mup_replay_origins_all();
 	return 0;
 }
 
@@ -3783,10 +3792,15 @@ static int bgp_zebra_process_srv6_locator_internal(struct srv6_locator *locator,
 
 	/*
 	 * Check if the BGP instance is configured to use the received
-	 * locator
+	 * locator.  Tolerate names that don't match the bgp primary as
+	 * long as some MUP export-policy registered them — the L3VPN side
+	 * still no-ops, but the MUP replay below picks the locator up.
 	 */
-	if (strcmp(bgp->srv6_locator_name, locator->name) != 0)
+	if (strcmp(bgp->srv6_locator_name, locator->name) != 0) {
+		if (bgp_mup_locator_name_is_tracked(locator->name))
+			bgp_mup_replay_origins_all();
 		return 0;
+	}
 
 	zlog_info("%s(%d): %s, Received SRv6 locator %s %pFX, loc-block-len=%u, loc-node-len=%u func-len=%u, arg-len=%u",
 		  bgp->name_pretty, bgp->vrf_id, __func__, locator->name, &locator->prefix,
@@ -3806,6 +3820,12 @@ static int bgp_zebra_process_srv6_locator_internal(struct srv6_locator *locator,
 	vpn_leak_postchange_all();
 	bgp_srv6_unicast_ensure_afi_sid(bgp, AFI_IP);
 	bgp_srv6_unicast_ensure_afi_sid(bgp, AFI_IP6);
+
+	/* BGP-MUP: replay any `segment interwork|direct` lines that were
+	 * accepted before the locator was available (config-file boot
+	 * order).  See bgp_mup_replay_origins_all().
+	 */
+	bgp_mup_replay_origins_all();
 
 	return 0;
 }
@@ -3885,6 +3905,18 @@ static int bgp_zebra_srv6_sid_notify(ZAPI_CALLBACK_ARGS)
 		afi = AFI_IP6;
 	else if (ctx.behavior == ZEBRA_SEG6_LOCAL_ACTION_END_DT4)
 		afi = AFI_IP;
+
+	/* BGP-MUP: give the MUP handler first shot.  ISD uses End.M.GTP4.E /
+	 * End.M.GTP6.E (exclusive to MUP); DSD uses End.DT4 / End.DT6 —
+	 * those overlap with VPN, so the MUP handler matches by pending
+	 * request and only claims the notification when a MUP originate is
+	 * actually waiting.  Otherwise we delegate to the VPN handler
+	 * below.
+	 */
+	if (note == ZAPI_SRV6_SID_ALLOCATED) {
+		if (bgp_mup_handle_sid_alloc(bgp_vrf, &ctx, &sid_addr, loc_name))
+			return 0;
+	}
 
 	/* Handle notification */
 	switch (note) {
@@ -4438,12 +4470,27 @@ static void bgp_zebra_process_srv6_locator_delete_per_bgp(struct srv6_locator *l
 		}
 	}
 
+	/* Symmetric counterpart of the locator-arrival hook
+	 * bgp_mup_replay_origins_all() invoked from
+	 * bgp_zebra_process_srv6_locator_internal(): clear any
+	 * BGP-MUP origin install fingerprint / OIF cache entries
+	 * pinned to the just-deleted locator and reannounce
+	 * T1ST/T2ST so the BGP RIB stops emitting UPDATEs into
+	 * the dead locator.
+	 *
+	 * Run BEFORE the bgp->srv6_locator NULL-out below: the
+	 * withdraw helpers reach bgp_mup_emit_isd() which begins
+	 * with bgp_srv6_locator_lookup() and bails on miss, so the
+	 * lookup must still resolve to the doomed locator here.
+	 * Mirrors L3VPN's vpn_leak_prechange ordering above.
+	 */
+	bgp_mup_process_srv6_locator_delete_per_bgp(loc, bgp);
+
 	// clear SRv6 locator
 	if (bgp->srv6_locator) {
 		srv6_locator_free(bgp->srv6_locator);
 		bgp->srv6_locator = NULL;
 	}
-
 
 	vpn_leak_postchange_all();
 }
@@ -4458,11 +4505,17 @@ static int bgp_zebra_process_srv6_locator_delete(ZAPI_CALLBACK_ARGS)
 		return -1;
 
 	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, bgp)) {
-		if (!bgp->srv6_locator)
+		if (bgp->srv6_locator && strmatch(bgp->srv6_locator->name, loc.name)) {
+			bgp_zebra_process_srv6_locator_delete_per_bgp(&loc, bgp);
 			continue;
-		if (!strmatch(bgp->srv6_locator->name, loc.name))
-			return 0;
-		bgp_zebra_process_srv6_locator_delete_per_bgp(&loc, bgp);
+		}
+		/* Per-policy MUP locator: not the bgp's primary, so the
+		 * full L3VPN cleanup above doesn't fire.  Invoke the MUP
+		 * delete hook directly so any ISD pinned to this locator
+		 * is withdrawn and re-requested when zebra reinstates it.
+		 */
+		if (bgp_mup_locator_name_is_tracked(loc.name))
+			bgp_mup_process_srv6_locator_delete_per_bgp(&loc, bgp);
 	}
 
 	return 0;
