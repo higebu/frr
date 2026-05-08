@@ -20,11 +20,10 @@
 
 PREDECL_LIST(zebra_announce);
 PREDECL_LIST(zebra_l2_vni);
-PREDECL_HASH(bgp_mup_isd_hash);
-PREDECL_HASH(bgp_mup_dsd_hash);
-PREDECL_HASH(bgp_mup_dsd_segid_hash);
 
 struct route_table;
+struct bgp_mup_state;
+struct bgp_mup_export_policy;
 
 enum bgp_bp_install_type {
 	BGP_BP_INSTALL_ROUTE,
@@ -152,6 +151,15 @@ struct bgp_master {
 
 	/* The Mac table */
 	struct hash *self_mac_hash;
+
+	/* BGP-MUP self-originated DSD key index.  Populated when a `segment
+	 * direct` line on any per-vrf bgp instance is persisted, drained on
+	 * forget / instance teardown.  Lets bgp_mup_dsd_is_self() answer in
+	 * O(1) on every received T2ST install instead of walking (per-vrf
+	 * bgp instance) x (DSD origins per instance).  ISD self-detection
+	 * walks bm->bgp directly against the per-(vrf, afi) export policy.
+	 */
+	struct hash *mup_self_dsd_hash;
 
 	/* BGP start time.  */
 	time_t start_time;
@@ -1090,26 +1098,14 @@ struct bgp {
 	/* BGP L3 service IPv4/v6 SRv6 backend */
 	struct srv6_policy srv6_unicast[AFI_MAX];
 
-	/* BGP-MUP discovery cache: received ISD/DSD routes used to resolve
-	 * incoming T1ST/T2ST routes (draft-ietf-bess-mup-safi Section 3.3.9 /
-	 * Section 3.3.12).  Opaque from bgpd.h's perspective; structures live in
-	 * bgp_mup.c.
-	 *
-	 * ISD: exact-match hash on (afi, prd, prefix) + per-AFI route_table for
-	 * LPM lookup of an ISD covering a T1ST endpoint.
-	 * DSD: exact-match hash on (afi, prd, endpoint) + segment_id hash for
-	 * T2ST resolution.
+	/* BGP-MUP per-bgp state: pending originates, persistent origin
+	 * records, ISD/DSD discovery caches (hash + per-AFI LPM tree),
+	 * and the per-AFI reannounce coalescing event.  Opaque pointer
+	 * to keep MUP-internal types out of bgpd.h; lazily allocated by
+	 * bgp_mup.c on first use, freed by bgp_mup_state_free() on
+	 * teardown.
 	 */
-	struct bgp_mup_isd_hash_head *mup_isd_hash;
-	struct route_table *mup_isd_lpm[AFI_MAX];
-	struct bgp_mup_dsd_hash_head *mup_dsd_hash;
-	struct bgp_mup_dsd_segid_hash_head *mup_dsd_segid_hash;
-
-	/* BGP-MUP discovery cache: pending coalesced reannounce of T1ST/T2ST
-	 * paths after ISD/DSD cache mutation.  One slot per AFI; a flood of
-	 * cache mutations within a single UPDATE collapses to one RIB walk.
-	 */
-	struct event *mup_reannounce_ev[AFI_MAX];
+	struct bgp_mup_state *mup_state;
 
 	/* BGP-MUP per-vrf-per-afi import RT list, populated by
 	 * `route-target import RTLIST` under `address-family ipv[46] mup`.
@@ -1120,6 +1116,21 @@ struct bgp {
 	 * so a vrf doing both L3VPN and MUP can scope import RTs per AF.
 	 */
 	struct ecommunity *mup_import_rtlist[AFI_MAX];
+
+	/* BGP-MUP per-vrf-per-afi export policy.  Mirrors L3VPN's
+	 * vpn_policy[afi] (TOVPN direction): RD, RT list, and SID
+	 * allocation knob configured once per (vrf, afi) under
+	 * `address-family ipv[46] unicast` via `rd mup export` /
+	 * `rt mup export` / `sid mup export`.  Drives ISD origination
+	 * from the unicast RIB through mup_leak_from_vrf_update() —
+	 * each N3 (gNB-side) reachability prefix in the unicast RIB
+	 * becomes one ISD NLRI carrying the policy's RD, RT list, and
+	 * the per-(vrf, afi) End.M.GTP4.E / End.M.GTP6.E SID.  Opaque
+	 * pointer to keep MUP-internal types out of bgpd.h; lazily
+	 * allocated by bgp_mup.c on first CLI mutation, freed by
+	 * bgp_mup_state_free().
+	 */
+	struct bgp_mup_export_policy *mup_export[AFI_MAX];
 
 	/* TCP keepalive parameters for BGP connection */
 	uint16_t tcp_keepalive_idle;

@@ -3764,6 +3764,12 @@ static int bgp_zebra_process_srv6_locator_internal(struct srv6_locator *locator,
 	bgp_srv6_unicast_ensure_afi_sid(bgp, AFI_IP);
 	bgp_srv6_unicast_ensure_afi_sid(bgp, AFI_IP6);
 
+	/* BGP-MUP: replay any `segment interwork|direct` lines that were
+	 * accepted before the locator was available (config-file boot
+	 * order).  See bgp_mup_replay_origins_all().
+	 */
+	bgp_mup_replay_origins_all();
+
 	return 0;
 }
 
@@ -3842,6 +3848,18 @@ static int bgp_zebra_srv6_sid_notify(ZAPI_CALLBACK_ARGS)
 		afi = AFI_IP6;
 	else if (ctx.behavior == ZEBRA_SEG6_LOCAL_ACTION_END_DT4)
 		afi = AFI_IP;
+
+	/* BGP-MUP: give the MUP handler first shot.  ISD uses End.M.GTP4.E /
+	 * End.M.GTP6.E (exclusive to MUP); DSD uses End.DT4 / End.DT6 —
+	 * those overlap with VPN, so the MUP handler matches by pending
+	 * request and only claims the notification when a MUP originate is
+	 * actually waiting.  Otherwise we fall through to the VPN handler
+	 * below.
+	 */
+	if (note == ZAPI_SRV6_SID_ALLOCATED) {
+		if (bgp_mup_handle_sid_alloc(bgp_vrf, &ctx, &sid_addr))
+			return 0;
+	}
 
 	/* Handle notification */
 	switch (note) {
@@ -4395,12 +4413,27 @@ static void bgp_zebra_process_srv6_locator_delete_per_bgp(struct srv6_locator *l
 		}
 	}
 
+	/* Symmetric counterpart of the locator-arrival hook
+	 * bgp_mup_replay_origins_all() invoked from
+	 * bgp_zebra_process_srv6_locator_internal(): clear any
+	 * BGP-MUP origin install fingerprint / OIF cache entries
+	 * pinned to the just-deleted locator and reannounce
+	 * T1ST/T2ST so the BGP RIB stops emitting UPDATEs into
+	 * the dead locator.
+	 *
+	 * Run BEFORE the bgp->srv6_locator NULL-out below: the
+	 * withdraw helpers reach bgp_mup_emit_isd() which begins
+	 * with bgp_srv6_locator_lookup() and bails on miss, so the
+	 * lookup must still resolve to the doomed locator here.
+	 * Mirrors L3VPN's vpn_leak_prechange ordering above.
+	 */
+	bgp_mup_process_srv6_locator_delete_per_bgp(loc, bgp);
+
 	// clear SRv6 locator
 	if (bgp->srv6_locator) {
 		srv6_locator_free(bgp->srv6_locator);
 		bgp->srv6_locator = NULL;
 	}
-
 
 	vpn_leak_postchange_all();
 }
