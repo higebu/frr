@@ -51,6 +51,7 @@
 #include "bgpd/bgp_regex.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_zebra.h"
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_vty.h"
@@ -64,7 +65,6 @@
 #include "bgpd/bgp_evpn_mh.h"
 #include "bgpd/bgp_addpath.h"
 #include "bgpd/bgp_mac.h"
-#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_flowspec.h"
 #include "bgpd/bgp_conditional_adv.h"
 #include "bgpd/bgp_srv6.h"
@@ -11710,9 +11710,9 @@ DEFUN_NOSH (address_family_ipv4_safi,
 		safi_t safi = bgp_vty_safi_from_str(argv[2]->text);
 		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT
 		    && safi != SAFI_UNICAST && safi != SAFI_MULTICAST
-		    && safi != SAFI_EVPN) {
+		    && safi != SAFI_EVPN && safi != SAFI_MUP) {
 			vty_out(vty,
-				"Only Unicast/Multicast/EVPN SAFIs supported in non-core instances.\n");
+				"Only Unicast/Multicast/EVPN/MUP SAFIs supported in non-core instances.\n");
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		vty->node = bgp_node_type(AFI_IP, safi);
@@ -11734,9 +11734,9 @@ DEFUN_NOSH (address_family_ipv6_safi,
 		safi_t safi = bgp_vty_safi_from_str(argv[2]->text);
 		if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT
 		    && safi != SAFI_UNICAST && safi != SAFI_MULTICAST
-		    && safi != SAFI_EVPN) {
+		    && safi != SAFI_EVPN && safi != SAFI_MUP) {
 			vty_out(vty,
-				"Only Unicast/Multicast/EVPN SAFIs supported in non-core instances.\n");
+				"Only Unicast/Multicast/EVPN/MUP SAFIs supported in non-core instances.\n");
 			return CMD_WARNING_CONFIG_FAILED;
 		}
 		vty->node = bgp_node_type(AFI_IP6, safi);
@@ -20945,6 +20945,8 @@ static void bgp_vpn_policy_config_write_afi(struct vty *vty, struct bgp *bgp,
 		vty_out(vty, "%*sroute-map vpn export %s\n", indent, "",
 			bgp->vpn_policy[afi]
 				.rmap_name[BGP_VPN_POLICY_DIR_TOVPN]);
+
+	bgp_mup_export_config_write(vty, bgp, afi, indent);
 
 	if (bgp->vpn_policy[afi].import_redirect_rtlist) {
 		char *b = ecommunity_ecom2str(
