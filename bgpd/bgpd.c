@@ -4791,9 +4791,27 @@ int bgp_delete(struct bgp *bgp)
 
 	/* Unset redistribution. */
 	for (afi = AFI_IP; afi < AFI_MAX; afi++)
-		for (i = 0; i < ZEBRA_ROUTE_MAX; i++)
-			if (i != ZEBRA_ROUTE_BGP)
-				bgp_redistribute_unset(bgp, afi, i, 0);
+		for (i = 0; i < ZEBRA_ROUTE_MAX; i++) {
+			struct list *red_list;
+			struct listnode *rnode, *rnnode;
+			struct bgp_redist *red;
+
+			if (i == ZEBRA_ROUTE_BGP)
+				continue;
+
+			red_list = bgp->redist[afi][i];
+			if (!red_list)
+				continue;
+
+			/* Walk every (safi, instance) entry registered for
+			 * this (afi, type) and unset each individually.  The
+			 * unset path mutates the list, so iterate with the
+			 * safe variant.
+			 */
+			for (ALL_LIST_ELEMENTS(red_list, rnode, rnnode, red))
+				bgp_redistribute_unset(bgp, afi, red->safi, i,
+						       red->instance);
+		}
 
 	/* Clear list of peers with connection errors - each
 	 * peer will need to check again, in case the io pthread is racing
