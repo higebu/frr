@@ -19533,8 +19533,8 @@ DEFUN (bgp_redistribute_ipv4,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	bgp_redist_add(bgp, AFI_IP, type, 0);
-	return bgp_redistribute_set(bgp, AFI_IP, type, 0, false);
+	bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), type, 0);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), type, 0, false);
 }
 
 ALIAS_HIDDEN(
@@ -19565,10 +19565,10 @@ DEFUN (bgp_redistribute_ipv4_rmap,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	red = bgp_redist_add(bgp, AFI_IP, type, 0);
+	red = bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), type, 0);
 	changed =
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
-	return bgp_redistribute_set(bgp, AFI_IP, type, 0, changed);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), type, 0, changed);
 }
 
 ALIAS_HIDDEN(
@@ -19601,9 +19601,9 @@ DEFUN (bgp_redistribute_ipv4_metric,
 	}
 	metric = strtoul(argv[idx_number]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP, type, 0);
+	red = bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), type, 0);
 	changed = bgp_redistribute_metric_set(bgp, red, AFI_IP, type, metric);
-	return bgp_redistribute_set(bgp, AFI_IP, type, 0, changed);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), type, 0, changed);
 }
 
 ALIAS_HIDDEN(
@@ -19641,11 +19641,11 @@ DEFUN (bgp_redistribute_ipv4_rmap_metric,
 	}
 	metric = strtoul(argv[idx_number]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP, type, 0);
+	red = bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), type, 0);
 	changed =
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
 	changed |= bgp_redistribute_metric_set(bgp, red, AFI_IP, type, metric);
-	return bgp_redistribute_set(bgp, AFI_IP, type, 0, changed);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), type, 0, changed);
 }
 
 ALIAS_HIDDEN(
@@ -19687,11 +19687,11 @@ DEFUN (bgp_redistribute_ipv4_metric_rmap,
 	}
 	metric = strtoul(argv[idx_number]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP, type, 0);
+	red = bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), type, 0);
 	changed = bgp_redistribute_metric_set(bgp, red, AFI_IP, type, metric);
 	changed |=
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
-	return bgp_redistribute_set(bgp, AFI_IP, type, 0, changed);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), type, 0, changed);
 }
 
 ALIAS_HIDDEN(
@@ -19739,8 +19739,8 @@ DEFUN (bgp_redistribute_ipv4_ospf,
 			protocol = ZEBRA_ROUTE_TABLE;
 	}
 
-	bgp_redist_add(bgp, AFI_IP, protocol, instance);
-	return bgp_redistribute_set(bgp, AFI_IP, protocol, instance, false);
+	bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance, false);
 }
 
 ALIAS_HIDDEN(bgp_redistribute_ipv4_ospf, bgp_redistribute_ipv4_ospf_hidden_cmd,
@@ -19792,10 +19792,10 @@ DEFUN (bgp_redistribute_ipv4_ospf_rmap,
 			protocol = ZEBRA_ROUTE_TABLE;
 	}
 
-	red = bgp_redist_add(bgp, AFI_IP, protocol, instance);
+	red = bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance);
 	changed =
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
-	return bgp_redistribute_set(bgp, AFI_IP, protocol, instance, changed);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance, changed);
 }
 
 ALIAS_HIDDEN(bgp_redistribute_ipv4_ospf_rmap,
@@ -19851,10 +19851,10 @@ DEFUN (bgp_redistribute_ipv4_ospf_metric,
 
 	metric = strtoul(argv[idx_number_2]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP, protocol, instance);
+	red = bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance);
 	changed = bgp_redistribute_metric_set(bgp, red, AFI_IP, protocol,
 						metric);
-	return bgp_redistribute_set(bgp, AFI_IP, protocol, instance, changed);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance, changed);
 }
 
 ALIAS_HIDDEN(bgp_redistribute_ipv4_ospf_metric,
@@ -19915,12 +19915,12 @@ DEFUN (bgp_redistribute_ipv4_ospf_rmap_metric,
 
 	metric = strtoul(argv[idx_number_2]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP, protocol, instance);
+	red = bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance);
 	changed =
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
 	changed |= bgp_redistribute_metric_set(bgp, red, AFI_IP, protocol,
 						metric);
-	return bgp_redistribute_set(bgp, AFI_IP, protocol, instance, changed);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance, changed);
 }
 
 ALIAS_HIDDEN(
@@ -19984,12 +19984,12 @@ DEFUN (bgp_redistribute_ipv4_ospf_metric_rmap,
 	instance = strtoul(argv[idx_number]->arg, NULL, 10);
 	metric = strtoul(argv[idx_number_2]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP, protocol, instance);
+	red = bgp_redist_add(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance);
 	changed = bgp_redistribute_metric_set(bgp, red, AFI_IP, protocol,
 						metric);
 	changed |=
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
-	return bgp_redistribute_set(bgp, AFI_IP, protocol, instance, changed);
+	return bgp_redistribute_set(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance, changed);
 }
 
 ALIAS_HIDDEN(
@@ -20045,7 +20045,7 @@ DEFUN (no_bgp_redistribute_ipv4_ospf,
 			protocol = ZEBRA_ROUTE_TABLE;
 	}
 
-	bgp_redistribute_unset(bgp, AFI_IP, protocol, instance);
+	bgp_redistribute_unset(bgp, AFI_IP, bgp_node_safi(vty), protocol, instance);
 	return CMD_SUCCESS;
 }
 
@@ -20083,7 +20083,7 @@ DEFUN (no_bgp_redistribute_ipv4,
 		vty_out(vty, "%% Invalid route type\n");
 		return CMD_WARNING_CONFIG_FAILED;
 	}
-	bgp_redistribute_unset(bgp, AFI_IP, type, 0);
+	bgp_redistribute_unset(bgp, AFI_IP, bgp_node_safi(vty), type, 0);
 	return CMD_SUCCESS;
 }
 
@@ -20114,8 +20114,8 @@ DEFUN (bgp_redistribute_ipv6,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	bgp_redist_add(bgp, AFI_IP6, type, 0);
-	return bgp_redistribute_set(bgp, AFI_IP6, type, 0, false);
+	bgp_redist_add(bgp, AFI_IP6, bgp_node_safi(vty), type, 0);
+	return bgp_redistribute_set(bgp, AFI_IP6, bgp_node_safi(vty), type, 0, false);
 }
 
 DEFUN (bgp_redistribute_ipv6_rmap,
@@ -20141,10 +20141,10 @@ DEFUN (bgp_redistribute_ipv6_rmap,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	red = bgp_redist_add(bgp, AFI_IP6, type, 0);
+	red = bgp_redist_add(bgp, AFI_IP6, bgp_node_safi(vty), type, 0);
 	changed =
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
-	return bgp_redistribute_set(bgp, AFI_IP6, type, 0, changed);
+	return bgp_redistribute_set(bgp, AFI_IP6, bgp_node_safi(vty), type, 0, changed);
 }
 
 DEFUN (bgp_redistribute_ipv6_metric,
@@ -20170,9 +20170,9 @@ DEFUN (bgp_redistribute_ipv6_metric,
 	}
 	metric = strtoul(argv[idx_number]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP6, type, 0);
+	red = bgp_redist_add(bgp, AFI_IP6, bgp_node_safi(vty), type, 0);
 	changed = bgp_redistribute_metric_set(bgp, red, AFI_IP6, type, metric);
-	return bgp_redistribute_set(bgp, AFI_IP6, type, 0, changed);
+	return bgp_redistribute_set(bgp, AFI_IP6, bgp_node_safi(vty), type, 0, changed);
 }
 
 DEFUN (bgp_redistribute_ipv6_rmap_metric,
@@ -20203,12 +20203,12 @@ DEFUN (bgp_redistribute_ipv6_rmap_metric,
 	}
 	metric = strtoul(argv[idx_number]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP6, type, 0);
+	red = bgp_redist_add(bgp, AFI_IP6, bgp_node_safi(vty), type, 0);
 	changed =
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
 	changed |= bgp_redistribute_metric_set(bgp, red, AFI_IP6, type,
 						metric);
-	return bgp_redistribute_set(bgp, AFI_IP6, type, 0, changed);
+	return bgp_redistribute_set(bgp, AFI_IP6, bgp_node_safi(vty), type, 0, changed);
 }
 
 DEFPY(bgp_redistribute_ipv6_table, bgp_redistribute_ipv6_table_cmd,
@@ -20240,15 +20240,15 @@ DEFPY(bgp_redistribute_ipv6_table, bgp_redistribute_ipv6_table_cmd,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	red = bgp_redist_add(bgp, AFI_IP6, ZEBRA_ROUTE_TABLE_DIRECT, table_id);
+	red = bgp_redist_add(bgp, AFI_IP6, bgp_node_safi(vty), ZEBRA_ROUTE_TABLE_DIRECT, table_id);
 	if (rmap)
 		changed = bgp_redistribute_rmap_set(red, rmap, route_map);
 	if (metric)
 		changed |= bgp_redistribute_metric_set(bgp, red, AFI_IP6,
 						       ZEBRA_ROUTE_TABLE_DIRECT,
 						       metric_val);
-	return bgp_redistribute_set(bgp, AFI_IP6, ZEBRA_ROUTE_TABLE_DIRECT,
-				    table_id, changed);
+	return bgp_redistribute_set(bgp, AFI_IP6, bgp_node_safi(vty),
+				    ZEBRA_ROUTE_TABLE_DIRECT, table_id, changed);
 }
 
 DEFPY(no_bgp_redistribute_ipv6_table, no_bgp_redistribute_ipv6_table_cmd,
@@ -20275,7 +20275,8 @@ DEFPY(no_bgp_redistribute_ipv6_table, no_bgp_redistribute_ipv6_table_cmd,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	bgp_redistribute_unset(bgp, AFI_IP6, ZEBRA_ROUTE_TABLE_DIRECT, table_id);
+	bgp_redistribute_unset(bgp, AFI_IP6, bgp_node_safi(vty),
+			       ZEBRA_ROUTE_TABLE_DIRECT, table_id);
 	return CMD_SUCCESS;
 }
 
@@ -20307,12 +20308,12 @@ DEFUN (bgp_redistribute_ipv6_metric_rmap,
 	}
 	metric = strtoul(argv[idx_number]->arg, NULL, 10);
 
-	red = bgp_redist_add(bgp, AFI_IP6, type, 0);
+	red = bgp_redist_add(bgp, AFI_IP6, bgp_node_safi(vty), type, 0);
 	changed = bgp_redistribute_metric_set(bgp, red, AFI_IP6, SAFI_UNICAST,
 						metric);
 	changed |=
 		bgp_redistribute_rmap_set(red, argv[idx_word]->arg, route_map);
-	return bgp_redistribute_set(bgp, AFI_IP6, type, 0, changed);
+	return bgp_redistribute_set(bgp, AFI_IP6, bgp_node_safi(vty), type, 0, changed);
 }
 
 DEFUN (no_bgp_redistribute_ipv6,
@@ -20336,7 +20337,7 @@ DEFUN (no_bgp_redistribute_ipv6,
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 
-	bgp_redistribute_unset(bgp, AFI_IP6, type, 0);
+	bgp_redistribute_unset(bgp, AFI_IP6, bgp_node_safi(vty), type, 0);
 	return CMD_SUCCESS;
 }
 
@@ -20675,35 +20676,34 @@ static void bgp_config_write_redistribute(struct vty *vty, struct bgp *bgp,
 {
 	int i;
 
-	/* Unicast redistribution only.  */
-	if (safi != SAFI_UNICAST)
-		return;
-
 	for (i = 0; i < ZEBRA_ROUTE_MAX; i++) {
-		/* Redistribute BGP does not make sense.  */
-		if (i != ZEBRA_ROUTE_BGP) {
-			struct list *red_list;
-			struct listnode *node;
-			struct bgp_redist *red;
+		struct list *red_list;
+		struct listnode *node;
+		struct bgp_redist *red;
 
-			red_list = bgp->redist[afi][i];
-			if (!red_list)
+		/* Redistribute BGP does not make sense.  */
+		if (i == ZEBRA_ROUTE_BGP)
+			continue;
+
+		red_list = bgp->redist[afi][i];
+		if (!red_list)
+			continue;
+
+		for (ALL_LIST_ELEMENTS_RO(red_list, node, red)) {
+			/* Emit only the entries configured under this SAFI. */
+			if (red->safi != safi)
 				continue;
 
-			for (ALL_LIST_ELEMENTS_RO(red_list, node, red)) {
-				/* "redistribute" configuration.  */
-				vty_out(vty, "  redistribute %s",
-					zebra_route_string(i));
-				if (red->instance)
-					vty_out(vty, " %d", red->instance);
-				if (red->redist_metric_flag)
-					vty_out(vty, " metric %u",
-						red->redist_metric);
-				if (red->rmap.name)
-					vty_out(vty, " route-map %s",
-						red->rmap.name);
-				vty_out(vty, "\n");
-			}
+			vty_out(vty, "  redistribute %s",
+				zebra_route_string(i));
+			if (red->instance)
+				vty_out(vty, " %d", red->instance);
+			if (red->redist_metric_flag)
+				vty_out(vty, " metric %u",
+					red->redist_metric);
+			if (red->rmap.name)
+				vty_out(vty, " route-map %s", red->rmap.name);
+			vty_out(vty, "\n");
 		}
 	}
 }
