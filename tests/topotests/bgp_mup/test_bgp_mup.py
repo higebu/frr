@@ -521,6 +521,97 @@ def test_t2st_install_vrf_selected_by_import_rt():
     )
 
 
+def test_route_map_mup_export_filter():
+    """`route-map mup export RMAP` filters which VRF unicast prefixes
+    leak as ISD NLRIs.  Mirrors L3VPN's `route-map vpn export` —
+    `bgp_mplsvpn.c:vpn_leak_from_vrf_update` runs the per-direction
+    rmap before the emit; MUP's parallel hook is in
+    `bgp_mup.c:mup_leak_from_vrf_update`.
+
+    Phase 1 covers the export side only; the import slot of the same
+    DEFPY stores state but does not yet apply (Phase 2)."""
+    tgen = get_topogen()
+    if tgen.routers_have_failure():
+        pytest.skip(tgen.errors)
+
+    r1 = tgen.gears["r1"]
+    r2 = tgen.gears["r2"]
+
+    # Add a second connected prefix into slice1.  redistribute connected
+    # leaks both into BGP unicast, and (until the rmap below kicks in)
+    # both reach r2 as ISD NLRIs.
+    r1.run("ip addr add 10.99.99.1/24 dev lo-slice1")
+
+    _wait_for(
+        r2,
+        lambda r: None
+        if _grep(r, "show bgp ipv4 mup all", "10.99.99.0/24")
+        else "expected 10.99.99.0/24 ISD on r2 before rmap is applied",
+        "baseline: 10.99.99.0/24 leaked",
+    )
+
+    # Configure a route-map permitting only 10.99.0.0/24, then attach
+    # it to slice1's ipv4 unicast AF as the export rmap.  10.99.99.0/24
+    # must drop out of r2's MUP RIB; 10.99.0.0/24 stays.
+    r1.vtysh_cmd(
+        "configure terminal\n"
+        "ip prefix-list N3-PFX seq 10 permit 10.99.0.0/24\n"
+        "route-map N3-ONLY permit 10\n"
+        " match ip address prefix-list N3-PFX\n"
+        "exit\n"
+        "router bgp 65001 vrf slice1\n"
+        " address-family ipv4 unicast\n"
+        "  route-map mup export N3-ONLY\n"
+        " exit-address-family\n"
+        "exit\n"
+    )
+
+    _wait_for(
+        r2,
+        lambda r: None
+        if not _grep(r, "show bgp ipv4 mup all", "10.99.99.0/24")
+        else "10.99.99.0/24 must be withdrawn while N3-ONLY is attached",
+        "filter on: 10.99.99.0/24 withdrawn",
+    )
+    assert _grep(r2, "show bgp ipv4 mup all", "10.99.0.0/24"), (
+        "10.99.0.0/24 must remain after the export filter is attached"
+    )
+
+    # `show running-config` must round-trip the rmap line.
+    output = r1.vtysh_cmd("show running-config")
+    assert "route-map mup export N3-ONLY" in output, (
+        "running-config missing route-map mup export line\n--- output ---\n"
+        + output
+    )
+
+    # Detach the rmap; 10.99.99.0/24 must reappear on r2.
+    r1.vtysh_cmd(
+        "configure terminal\n"
+        "router bgp 65001 vrf slice1\n"
+        " address-family ipv4 unicast\n"
+        "  no route-map mup export N3-ONLY\n"
+        " exit-address-family\n"
+        "exit\n"
+    )
+
+    _wait_for(
+        r2,
+        lambda r: None
+        if _grep(r, "show bgp ipv4 mup all", "10.99.99.0/24")
+        else "10.99.99.0/24 must be re-leaked after the export filter is removed",
+        "filter off: 10.99.99.0/24 re-leaked",
+    )
+
+    # Cleanup helper state so downstream tests aren't perturbed.
+    r1.run("ip addr del 10.99.99.1/24 dev lo-slice1")
+    r1.vtysh_cmd(
+        "configure terminal\n"
+        "no route-map N3-ONLY permit 10\n"
+        "no ip prefix-list N3-PFX\n"
+        "exit\n"
+    )
+
+
 def test_no_segment_removes_route():
     """`no segment mup export direct` must withdraw the DSD from both
     r1 and r2 RIBs, drop the line from running-config, AND cause r2 to

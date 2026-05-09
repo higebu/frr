@@ -10,6 +10,7 @@
 #include "jhash.h"
 #include "linklist.h"
 #include "prefix.h"
+#include "routemap.h"
 #include "stream.h"
 #include "table.h"
 #include "typesafe.h"
@@ -108,6 +109,17 @@ struct bgp_mup_export_policy {
 	char *tovpn_rd_pretty;
 	struct prefix_rd tovpn_rd;
 	struct ecommunity *rtlist[BGP_MUP_POLICY_DIR_MAX];
+
+	/* Per-direction route-map plumbing.  Mirrors L3VPN's
+	 * vpn_policy[afi].rmap_name[] / .rmap[] in bgpd/bgp_mplsvpn.c —
+	 * configured via `route-map mup <import|export> RMAP` under
+	 * `address-family ipv[46] unicast`.  The TOMUP slot filters
+	 * VRF→MUP leaked ISDs (mup_leak_from_vrf_update); the FROMMUP
+	 * slot is reserved for receive-side filtering (Phase 2; the
+	 * Phase 1 CLI stores the value but does not apply it).
+	 */
+	char *rmap_name[BGP_MUP_POLICY_DIR_MAX];
+	struct route_map *rmap[BGP_MUP_POLICY_DIR_MAX];
 
 	/* Optional per-policy locator override.  NULL => fall back to
 	 * bgp->srv6_locator_name.  Deliberate deviation from L3VPN's
@@ -234,6 +246,8 @@ static void bgp_mup_export_clear(struct bgp *bgp, afi_t afi)
 	for (dir = 0; dir < BGP_MUP_POLICY_DIR_MAX; ++dir) {
 		if (p->rtlist[dir])
 			ecommunity_free(&p->rtlist[dir]);
+		XFREE(MTYPE_ROUTE_MAP_NAME, p->rmap_name[dir]);
+		p->rmap[dir] = NULL;
 	}
 	XFREE(MTYPE_BGP_NAME, p->locator_name);
 	XFREE(MTYPE_BGP_MUP_STR, p->dsd_mup_str);
@@ -3528,6 +3542,28 @@ void mup_leak_from_vrf_update(struct bgp *to_bgp, struct bgp *from_bgp,
 	if (!ep->tovpn_sid_ready)
 		return; /* defer: SID-arrival callback will replay via update_all */
 
+	/* Phase 1 export-side route-map filter.  Mirrors L3VPN's
+	 * filter step in bgpd/bgp_mplsvpn.c:vpn_leak_from_vrf_update.
+	 * Filter-only initial cut: any rmap-applied attribute mutation is
+	 * dropped — the emitted ISD attr is locally built from the policy
+	 * (SID/RT/nexthop), not derived from the unicast attr, so set-clauses
+	 * cannot meaningfully ride through to the wire.
+	 */
+	if (ep->rmap[BGP_MUP_POLICY_DIR_TOMUP]) {
+		struct bgp_path_info info;
+		struct bgp_path_info_extra path_extra;
+		struct attr static_attr = *path_vrf->attr;
+		struct peer *peer = path_vrf->peer ? path_vrf->peer : to_bgp->peer_self;
+		route_map_result_t rmap_ret;
+
+		prep_for_rmap_apply(&info, &path_extra, path_vrf->net, path_vrf, peer, NULL,
+				    &static_attr);
+		rmap_ret = route_map_apply(ep->rmap[BGP_MUP_POLICY_DIR_TOMUP], p, &info);
+		bgp_attr_flush(&static_attr);
+		if (rmap_ret == RMAP_DENYMATCH)
+			return;
+	}
+
 	args.afi = afi;
 	args.prd = ep->tovpn_rd;
 	args.ecom = ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP];
@@ -4075,6 +4111,126 @@ ALIAS (af_rt_mup,
        "For routes leaked from current unicast address-family to BGP-MUP\n"
        "both import and export\n")
 
+/* Mirror af_route_map_vpn_imexport_cmd in bgpd/bgp_vty.c.  L3VPN's
+ * route-map DEFPY accepts only <import|export> (no `both`), so MUP
+ * follows the same shape for parity.  Phase 1 enforces only the
+ * export side; the import slot stores state so writeback round-trips,
+ * but the apply happens in Phase 2 (receive-side dispatch).
+ */
+DEFPY (af_route_map_mup_imexport,
+       af_route_map_mup_imexport_cmd,
+       "[no] route-map mup <import|export>$direction_str RMAP$rmap_str",
+       NO_STR
+       "Specify route map\n"
+       "Between current address-family and BGP-MUP\n"
+       "For routes leaked from BGP-MUP into current unicast address-family\n"
+       "For routes leaked from current unicast address-family to BGP-MUP\n"
+       "name of route-map\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int dodir[BGP_MUP_POLICY_DIR_MAX] = {};
+	enum bgp_mup_policy_dir dir;
+	int idx = 0;
+	bool yes = true;
+	int ret;
+
+	if (argv_find(argv, argc, "no", &idx))
+		yes = false;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	ret = mup_policy_getdirs(vty, direction_str, dodir);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	for (dir = 0; dir < BGP_MUP_POLICY_DIR_MAX; ++dir) {
+		if (!dodir[dir])
+			continue;
+
+		if (dir == BGP_MUP_POLICY_DIR_TOMUP)
+			mup_leak_prechange(afi, bgp);
+
+		ep = bgp_mup_export_get(bgp, afi);
+		XFREE(MTYPE_ROUTE_MAP_NAME, ep->rmap_name[dir]);
+		ep->rmap[dir] = NULL;
+		if (yes) {
+			ep->rmap_name[dir] = XSTRDUP(MTYPE_ROUTE_MAP_NAME, rmap_str);
+			ep->rmap[dir] = route_map_lookup_warn_noexist(vty, rmap_str);
+		}
+
+		if (dir == BGP_MUP_POLICY_DIR_TOMUP)
+			mup_leak_postchange(afi, bgp);
+		else if (yes)
+			vty_out(vty,
+				"%% route-map mup import: state stored, not yet applied (Phase 1: export side only)\n");
+	}
+
+	return CMD_SUCCESS;
+}
+
+ALIAS (af_route_map_mup_imexport,
+       af_no_route_map_mup_imexport_cmd,
+       "no route-map mup <import|export>$direction_str",
+       NO_STR
+       "Specify route map\n"
+       "Between current address-family and BGP-MUP\n"
+       "For routes leaked from BGP-MUP into current unicast address-family\n"
+       "For routes leaked from current unicast address-family to BGP-MUP\n")
+
+/* Re-resolve route-map pointers and trigger a leak prechange/postchange
+ * pair on every (bgp, afi) whose policy references @rmap_name, so an
+ * edit / definition / deletion of a route-map body propagates to the
+ * already-leaked ISD set.  Mirrors vpn_policy_routemap_update in
+ * bgpd/bgp_mplsvpn.c — only the TOMUP slot triggers a re-leak in
+ * Phase 1 (FROMMUP is unenforced, so a refresh would change nothing).
+ */
+static void mup_policy_routemap_update(struct bgp *bgp, const char *rmap_name)
+{
+	struct route_map *rmap;
+	struct bgp_mup_export_policy *ep;
+	afi_t afi;
+	enum bgp_mup_policy_dir dir;
+
+	if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT && bgp->inst_type != BGP_INSTANCE_TYPE_VRF)
+		return;
+
+	rmap = route_map_lookup_by_name(rmap_name); /* NULL if deleted */
+
+	for (afi = AFI_IP; afi < AFI_MAX; ++afi) {
+		ep = bgp_mup_export_peek(bgp, afi);
+		if (!ep)
+			continue;
+
+		for (dir = 0; dir < BGP_MUP_POLICY_DIR_MAX; ++dir) {
+			if (!ep->rmap_name[dir] || strcmp(rmap_name, ep->rmap_name[dir]) != 0)
+				continue;
+
+			if (dir == BGP_MUP_POLICY_DIR_TOMUP)
+				mup_leak_prechange(afi, bgp);
+
+			ep->rmap[dir] = rmap;
+
+			if (dir == BGP_MUP_POLICY_DIR_TOMUP)
+				mup_leak_postchange(afi, bgp);
+		}
+	}
+}
+
+void mup_policy_routemap_event(const char *rmap_name)
+{
+	struct listnode *mnode, *mnnode;
+	struct bgp *bgp;
+
+	if (!bm || !bm->bgp)
+		return;
+	for (ALL_LIST_ELEMENTS(bm->bgp, mnode, mnnode, bgp))
+		mup_policy_routemap_update(bgp, rmap_name);
+}
+
 DEFPY (af_sid_mup_export,
        af_sid_mup_export_cmd,
        "[no] sid mup export <auto$sid_auto|explicit$sid_explicit X:X::X:X$sid_value> [locator WORD$loc_name]",
@@ -4290,6 +4446,13 @@ void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, in
 			XFREE(MTYPE_ECOMMUNITY_STR, b);
 		}
 	}
+
+	if (ep->rmap_name[BGP_MUP_POLICY_DIR_FROMMUP])
+		vty_out(vty, "%*sroute-map mup import %s\n", indent, "",
+			ep->rmap_name[BGP_MUP_POLICY_DIR_FROMMUP]);
+	if (ep->rmap_name[BGP_MUP_POLICY_DIR_TOMUP])
+		vty_out(vty, "%*sroute-map mup export %s\n", indent, "",
+			ep->rmap_name[BGP_MUP_POLICY_DIR_TOMUP]);
 
 	if (ep->flags & BGP_MUP_EXPORT_SID_AUTO) {
 		vty_out(vty, "%*ssid mup export auto", indent, "");
@@ -4740,6 +4903,8 @@ void bgp_mup_vty_init(void)
 	install_element(BGP_IPV4_NODE, &af_no_rd_mup_export_cmd);
 	install_element(BGP_IPV4_NODE, &af_rt_mup_cmd);
 	install_element(BGP_IPV4_NODE, &af_no_rt_mup_cmd);
+	install_element(BGP_IPV4_NODE, &af_route_map_mup_imexport_cmd);
+	install_element(BGP_IPV4_NODE, &af_no_route_map_mup_imexport_cmd);
 	install_element(BGP_IPV4_NODE, &af_sid_mup_export_cmd);
 	install_element(BGP_IPV4_NODE, &af_no_sid_mup_export_cmd);
 	install_element(BGP_IPV4_NODE, &af_nexthop_mup_export_cmd);
@@ -4754,6 +4919,8 @@ void bgp_mup_vty_init(void)
 	install_element(BGP_IPV6_NODE, &af_no_rd_mup_export_cmd);
 	install_element(BGP_IPV6_NODE, &af_rt_mup_cmd);
 	install_element(BGP_IPV6_NODE, &af_no_rt_mup_cmd);
+	install_element(BGP_IPV6_NODE, &af_route_map_mup_imexport_cmd);
+	install_element(BGP_IPV6_NODE, &af_no_route_map_mup_imexport_cmd);
 	install_element(BGP_IPV6_NODE, &af_sid_mup_export_cmd);
 	install_element(BGP_IPV6_NODE, &af_no_sid_mup_export_cmd);
 	install_element(BGP_IPV6_NODE, &af_nexthop_mup_export_cmd);

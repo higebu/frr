@@ -166,6 +166,14 @@ void mup_leak_from_vrf_withdraw_all(struct bgp *to_bgp, struct bgp *from_bgp, af
 void mup_leak_prechange(afi_t afi, struct bgp *bgp);
 void mup_leak_postchange(afi_t afi, struct bgp *bgp);
 
+/* Route-map module callback: a route-map of @rmap_name was added,
+ * deleted, or modified.  Re-resolve any bgp->mup_export[afi]->rmap[]
+ * pointers and replay the affected (vrf, afi) leaks.  Mirrors
+ * vpn_policy_routemap_event in bgpd/bgp_mplsvpn.c — registered
+ * alongside it from bgp_routemap.c.
+ */
+void mup_policy_routemap_event(const char *rmap_name);
+
 /* `bgp retain route-target all` filter.  Returns true iff @attr's RT
  * extended communities match no per-VRF `route-target import` list,
  * i.e. the NLRI should be filtered out at receive time when the
