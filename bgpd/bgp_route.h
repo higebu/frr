@@ -926,8 +926,8 @@ extern void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union 
 				 const struct seg6local_context *seg6local_ctx);
 extern void bgp_redistribute_delete(struct bgp *bgp, struct prefix *p, uint8_t type,
 				    unsigned short instance);
-extern void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, int type,
-				      unsigned short instance);
+extern void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, safi_t safi,
+				      int type, unsigned short instance);
 
 extern void bgp_static_add(struct bgp *bgp);
 extern void bgp_static_delete(struct bgp *bgp);
