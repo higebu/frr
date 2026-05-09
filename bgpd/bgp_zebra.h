@@ -67,22 +67,23 @@ extern void bgp_zebra_instance_deregister(struct bgp *bgp);
 
 extern void bgp_redistribute_redo(struct bgp *bgp);
 extern struct bgp_redist *bgp_redist_lookup(struct bgp *bgp, afi_t afi,
-					    uint8_t type,
+					    safi_t safi, uint8_t type,
 					    unsigned short instance);
-extern struct bgp_redist *bgp_redist_add(struct bgp *bgp, afi_t afi,
+extern struct bgp_redist *bgp_redist_add(struct bgp *bgp, afi_t afi, safi_t safi,
 					 uint8_t type, unsigned short instance);
-extern int bgp_redistribute_set(struct bgp *bgp, afi_t afi, int type,
-				unsigned short instance, bool changed);
+extern int bgp_redistribute_set(struct bgp *bgp, afi_t afi, safi_t safi,
+				int type, unsigned short instance,
+				bool changed);
 extern int bgp_redistribute_resend(struct bgp *bgp, afi_t afi, int type,
 				   unsigned short instance);
 extern bool bgp_redistribute_rmap_set(struct bgp_redist *red, const char *name,
 				      struct route_map *route_map);
 extern bool bgp_redistribute_metric_set(struct bgp *bgp, struct bgp_redist *red,
 					afi_t afi, int type, uint32_t metric);
-extern void bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
-				   unsigned short instance);
-extern int bgp_redistribute_unreg(struct bgp *bgp, afi_t afi, int type,
-				  unsigned short instance);
+extern void bgp_redistribute_unset(struct bgp *bgp, afi_t afi, safi_t safi,
+				   int type, unsigned short instance);
+extern int bgp_redistribute_unreg(struct bgp *bgp, afi_t afi, safi_t safi,
+				  int type, unsigned short instance);
 
 extern struct interface *if_lookup_by_ipv4(struct in_addr *addr,
 					   vrf_id_t vrf_id);

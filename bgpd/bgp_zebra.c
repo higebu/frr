@@ -2182,8 +2182,8 @@ void bgp_zebra_withdraw_table_all_subtypes(struct bgp *bgp, afi_t afi, safi_t sa
 	}
 }
 
-struct bgp_redist *bgp_redist_lookup(struct bgp *bgp, afi_t afi, uint8_t type,
-				     unsigned short instance)
+struct bgp_redist *bgp_redist_lookup(struct bgp *bgp, afi_t afi, safi_t safi,
+				     uint8_t type, unsigned short instance)
 {
 	struct list *red_list;
 	struct listnode *node;
@@ -2194,19 +2194,43 @@ struct bgp_redist *bgp_redist_lookup(struct bgp *bgp, afi_t afi, uint8_t type,
 		return (NULL);
 
 	for (ALL_LIST_ELEMENTS_RO(red_list, node, red))
-		if (red->instance == instance)
+		if (red->safi == safi && red->instance == instance)
 			return red;
 
 	return NULL;
 }
 
-struct bgp_redist *bgp_redist_add(struct bgp *bgp, afi_t afi, uint8_t type,
-				  unsigned short instance)
+/* Return true if zebra is already registered for this (afi, type, instance)
+ * triple under any SAFI other than the one passed in.  Used to deduplicate
+ * the zebra-side registration when the same redistribute is configured under
+ * multiple address-families.
+ */
+static bool bgp_redist_other_safi_exists(struct bgp *bgp, afi_t afi,
+					 safi_t safi, uint8_t type,
+					 unsigned short instance)
+{
+	struct list *red_list;
+	struct listnode *node;
+	struct bgp_redist *red;
+
+	red_list = bgp->redist[afi][type];
+	if (!red_list)
+		return false;
+
+	for (ALL_LIST_ELEMENTS_RO(red_list, node, red))
+		if (red->safi != safi && red->instance == instance)
+			return true;
+
+	return false;
+}
+
+struct bgp_redist *bgp_redist_add(struct bgp *bgp, afi_t afi, safi_t safi,
+				  uint8_t type, unsigned short instance)
 {
 	struct list *red_list;
 	struct bgp_redist *red;
 
-	red = bgp_redist_lookup(bgp, afi, type, instance);
+	red = bgp_redist_lookup(bgp, afi, safi, type, instance);
 	if (red)
 		return red;
 
@@ -2215,6 +2239,7 @@ struct bgp_redist *bgp_redist_add(struct bgp *bgp, afi_t afi, uint8_t type,
 
 	red_list = bgp->redist[afi][type];
 	red = XCALLOC(MTYPE_BGP_REDIST, sizeof(struct bgp_redist));
+	red->safi = safi;
 	red->instance = instance;
 
 	listnode_add(red_list, red);
@@ -2222,12 +2247,12 @@ struct bgp_redist *bgp_redist_add(struct bgp *bgp, afi_t afi, uint8_t type,
 	return red;
 }
 
-static void bgp_redist_del(struct bgp *bgp, afi_t afi, uint8_t type,
-			   unsigned short instance)
+static void bgp_redist_del(struct bgp *bgp, afi_t afi, safi_t safi,
+			   uint8_t type, unsigned short instance)
 {
 	struct bgp_redist *red;
 
-	red = bgp_redist_lookup(bgp, afi, type, instance);
+	red = bgp_redist_lookup(bgp, afi, safi, type, instance);
 
 	if (red) {
 		listnode_delete(bgp->redist[afi][type], red);
@@ -2238,7 +2263,7 @@ static void bgp_redist_del(struct bgp *bgp, afi_t afi, uint8_t type,
 }
 
 /* Other routes redistribution into BGP. */
-int bgp_redistribute_set(struct bgp *bgp, afi_t afi, int type,
+int bgp_redistribute_set(struct bgp *bgp, afi_t afi, safi_t safi, int type,
 			 unsigned short instance, bool changed)
 {
 	/* If redistribute options are changed call
@@ -2246,7 +2271,15 @@ int bgp_redistribute_set(struct bgp *bgp, afi_t afi, int type,
 	 * the routes
 	 */
 	if (changed)
-		bgp_redistribute_unreg(bgp, afi, type, instance);
+		bgp_redistribute_unreg(bgp, afi, safi, type, instance);
+
+	/* If zebra is already registered for this (afi, type, instance)
+	 * under another SAFI, no need to (re-)register on the wire.  The
+	 * per-SAFI bgp_redist entry is what drives the per-prefix RIB
+	 * insertion in bgp_redistribute_add().
+	 */
+	if (bgp_redist_other_safi_exists(bgp, afi, safi, type, instance))
+		return CMD_SUCCESS;
 
 	/* Return if already redistribute flag is set. */
 	if (instance) {
@@ -2368,7 +2401,7 @@ bool bgp_redistribute_metric_set(struct bgp *bgp, struct bgp_redist *red,
 	red->redist_metric_flag = 1;
 	red->redist_metric = metric;
 
-	for (dest = bgp_table_top(bgp->rib[afi][SAFI_UNICAST]); dest;
+	for (dest = bgp_table_top(bgp->rib[afi][red->safi]); dest;
 	     dest = bgp_route_next(dest)) {
 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
 			if (pi->sub_type == BGP_ROUTE_REDISTRIBUTE
@@ -2385,7 +2418,7 @@ bool bgp_redistribute_metric_set(struct bgp *bgp, struct bgp_redist *red,
 
 				bgp_path_info_set_flag(dest, pi,
 						       BGP_PATH_ATTR_CHANGED);
-				bgp_process(bgp, dest, pi, afi, SAFI_UNICAST);
+				bgp_process(bgp, dest, pi, afi, red->safi);
 			}
 		}
 	}
@@ -2394,14 +2427,21 @@ bool bgp_redistribute_metric_set(struct bgp *bgp, struct bgp_redist *red,
 }
 
 /* Unset redistribution.  */
-int bgp_redistribute_unreg(struct bgp *bgp, afi_t afi, int type,
+int bgp_redistribute_unreg(struct bgp *bgp, afi_t afi, safi_t safi, int type,
 			   unsigned short instance)
 {
 	struct bgp_redist *red;
 
-	red = bgp_redist_lookup(bgp, afi, type, instance);
+	red = bgp_redist_lookup(bgp, afi, safi, type, instance);
 	if (!red)
 		return CMD_SUCCESS;
+
+	/* Always withdraw the per-SAFI RIB.  Skip the zebra-side
+	 * deregistration if another SAFI still uses this (afi, type,
+	 * instance) — the zebra registration is shared across SAFIs.
+	 */
+	if (bgp_redist_other_safi_exists(bgp, afi, safi, type, instance))
+		goto withdraw;
 
 	/* Return if zebra connection is disabled. */
 	if (instance) {
@@ -2412,18 +2452,18 @@ int bgp_redistribute_unreg(struct bgp *bgp, afi_t afi, int type,
 			};
 			if (redist_lookup_table_direct(&bgp_zclient->mi_redist[afi][type], &table) ==
 			    NULL)
-				return CMD_WARNING;
+				goto withdraw;
 
 			redist_del_table_direct(&bgp_zclient->mi_redist[afi][type], &table);
 		} else {
 			if (!redist_check_instance(&bgp_zclient->mi_redist[afi][type], instance))
-				return CMD_WARNING;
+				goto withdraw;
 
 			redist_del_instance(&bgp_zclient->mi_redist[afi][type], instance);
 		}
 	} else {
 		if (!vrf_bitmap_check(&bgp_zclient->redist[afi][type], bgp->vrf_id))
-			return CMD_WARNING;
+			goto withdraw;
 		vrf_bitmap_unset(&bgp_zclient->redist[afi][type], bgp->vrf_id);
 	}
 
@@ -2437,15 +2477,16 @@ int bgp_redistribute_unreg(struct bgp *bgp, afi_t afi, int type,
 					type, instance, bgp->vrf_id);
 	}
 
+withdraw:
 	/* Withdraw redistributed routes from current BGP's routing table. */
-	bgp_redistribute_withdraw(bgp, afi, type, instance);
+	bgp_redistribute_withdraw(bgp, afi, safi, type, instance);
 
 	return CMD_SUCCESS;
 }
 
 /* Unset redistribution.  */
-static void _bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
-				    unsigned short instance)
+static void _bgp_redistribute_unset(struct bgp *bgp, afi_t afi, safi_t safi,
+				    int type, unsigned short instance)
 {
 	struct bgp_redist *red;
 
@@ -2460,11 +2501,11 @@ static void _bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
 	}
 #endif
 
-	red = bgp_redist_lookup(bgp, afi, type, instance);
+	red = bgp_redist_lookup(bgp, afi, safi, type, instance);
 	if (!red)
 		return;
 
-	bgp_redistribute_unreg(bgp, afi, type, instance);
+	bgp_redistribute_unreg(bgp, afi, safi, type, instance);
 
 	/* Unset route-map. */
 	XFREE(MTYPE_ROUTE_MAP_NAME, red->rmap.name);
@@ -2475,10 +2516,10 @@ static void _bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
 	red->redist_metric_flag = 0;
 	red->redist_metric = 0;
 
-	bgp_redist_del(bgp, afi, type, instance);
+	bgp_redist_del(bgp, afi, safi, type, instance);
 }
 
-void bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
+void bgp_redistribute_unset(struct bgp *bgp, afi_t afi, safi_t safi, int type,
 			    unsigned short instance)
 {
 	struct listnode *node, *nnode;
@@ -2486,14 +2527,16 @@ void bgp_redistribute_unset(struct bgp *bgp, afi_t afi, int type,
 
 	if ((type != ZEBRA_ROUTE_TABLE && type != ZEBRA_ROUTE_TABLE_DIRECT) ||
 	    instance != 0)
-		return _bgp_redistribute_unset(bgp, afi, type, instance);
+		return _bgp_redistribute_unset(bgp, afi, safi, type, instance);
 
 	/* walk over instance */
 	if (!bgp->redist[afi][type])
 		return;
 
 	for (ALL_LIST_ELEMENTS(bgp->redist[afi][type], node, nnode, red))
-		_bgp_redistribute_unset(bgp, afi, type, red->instance);
+		if (red->safi == safi)
+			_bgp_redistribute_unset(bgp, afi, safi, type,
+						red->instance);
 }
 
 void bgp_redistribute_redo(struct bgp *bgp)
