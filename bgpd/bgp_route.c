@@ -11884,6 +11884,9 @@ DEFPY(aggregate_addressv6, aggregate_addressv6_cmd,
 				 suppress_map, upa_enabled, upa_drop_flag, upa_max);
 }
 
+static void bgp_redistribute_one_delete(struct bgp *bgp, struct bgp_redist *red, struct prefix *p,
+					afi_t afi, uint8_t type, unsigned short instance);
+
 /* Redistribute route treatment. */
 
 void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr *nexthop,
@@ -11900,6 +11903,8 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr 
 	afi_t afi;
 	route_map_result_t ret;
 	struct bgp_redist *red;
+	struct list *red_list;
+	struct listnode *node;
 	struct interface *ifp;
 
 	if (CHECK_FLAG(bgp->flags, BGP_FLAG_DELETE_IN_PROGRESS) ||
@@ -11977,11 +11982,18 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr 
 	/* Handle BGP-LS concerns including SRv6 localsid updates */
 	bgp_ls_handle_route_add(bgp, p, afi, type, instance, seg6local_action, seg6local_ctx);
 
-	red = bgp_redist_lookup(bgp, afi, type, instance);
-	if (red) {
+	red_list = bgp->redist[afi][type];
+	if (!red_list)
+		goto done;
+
+	for (ALL_LIST_ELEMENTS_RO(red_list, node, red)) {
 		struct attr attr_new;
 		struct bgp_path_info_extra rmap_extra = {};
 		struct bgp_path_info rmap_path = { .extra = &rmap_extra };
+		safi_t safi = red->safi;
+
+		if (red->instance != instance)
+			continue;
 
 		/* Copy attribute for modification. */
 		attr_new = attr;
@@ -12006,18 +12018,18 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr 
 				/* Free uninterned attribute. */
 				bgp_attr_flush(&attr_new);
 
-				/* Unintern original. */
-				aspath_unintern(&attr.aspath);
-				bgp_redistribute_delete(bgp, p, type, instance);
-				return;
+				/* Withdraw any previously-installed redist
+				 * route from this SAFI's RIB.
+				 */
+				bgp_redistribute_one_delete(bgp, red, p, afi, type, instance);
+				continue;
 			}
 		}
 
 		if (bgp_in_graceful_shutdown(bgp))
 			bgp_attr_add_gshut_community(&attr_new);
 
-		bn = bgp_afi_node_get(bgp->rib[afi][SAFI_UNICAST], afi,
-				      SAFI_UNICAST, p, NULL);
+		bn = bgp_afi_node_get(bgp->rib[afi][safi], afi, safi, p, NULL);
 
 		new_attr = bgp_attr_intern(&attr_new);
 
@@ -12033,9 +12045,8 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr 
 			    attrhash_cmp(bpi->attr, new_attr) &&
 			    bgp_path_info_extra_same(bpi, &rmap_path)) {
 				bgp_attr_unintern(&new_attr);
-				aspath_unintern(&attr.aspath);
 				bgp_dest_unlock_node(bn);
-				return;
+				continue;
 			} else {
 				/* The attribute is changed. */
 				bgp_path_info_set_flag(bn, bpi,
@@ -12045,33 +12056,33 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr 
 				if (CHECK_FLAG(bpi->flags, BGP_PATH_REMOVED))
 					bgp_path_info_restore(bn, bpi);
 				else
-					bgp_aggregate_decrement(
-						bgp, p, bpi, afi, SAFI_UNICAST);
+					bgp_aggregate_decrement(bgp, p, bpi, afi, safi);
 				bgp_attr_unintern(&bpi->attr);
 				bpi->attr = new_attr;
 				bpi->uptime = monotime(NULL);
 				bgp_path_info_extra_propagate(bpi, &rmap_path);
 
 				/* Process change. */
-				bgp_aggregate_increment(bgp, p, bpi, afi,
-							SAFI_UNICAST);
-				bgp_process(bgp, bn, bpi, afi, SAFI_UNICAST);
+				bgp_aggregate_increment(bgp, p, bpi, afi, safi);
+				bgp_process(bgp, bn, bpi, afi, safi);
 				bgp_dest_unlock_node(bn);
-				aspath_unintern(&attr.aspath);
 
-				if ((bgp->inst_type == BGP_INSTANCE_TYPE_VRF)
-				    || (bgp->inst_type
-					== BGP_INSTANCE_TYPE_DEFAULT)) {
-
-					vpn_leak_from_vrf_update(
-						bgp_get_default(), bgp, bpi);
+				/* The cross-SAFI hooks below were authored
+				 * around SAFI_UNICAST redistribution and have
+				 * no equivalent for non-unicast SAFIs.
+				 */
+				if (safi == SAFI_UNICAST) {
+					if (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+					    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)
+						vpn_leak_from_vrf_update(bgp_get_default(), bgp,
+									 bpi);
+					if (advertise_type5_routes_multipath(bgp, afi) &&
+					    is_route_injectable_into_evpn(bgp, afi, safi, bpi))
+						bgp_evpn_export_type5_route(bgp, bn, bpi, afi,
+									    safi);
+					bgp_ls_originate_bgp_prefix(bgp, afi, safi, bn, bpi);
 				}
-				if (advertise_type5_routes_multipath(bgp, afi) &&
-				    is_route_injectable_into_evpn(bgp, afi, SAFI_UNICAST, bpi))
-					bgp_evpn_export_type5_route(bgp, bn, bpi, afi,
-								    SAFI_UNICAST);
-				bgp_ls_originate_bgp_prefix(bgp, afi, SAFI_UNICAST, bn, bpi);
-				return;
+				continue;
 			}
 		}
 
@@ -12081,34 +12092,65 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr 
 		bgp_path_info_extra_propagate(new, &rmap_path);
 
 		bgp_path_info_add(bn, new);
-		bgp_aggregate_increment(bgp, p, new, afi, SAFI_UNICAST);
+		bgp_aggregate_increment(bgp, p, new, afi, safi);
 		SET_FLAG(bn->flags, BGP_NODE_FIB_INSTALLED);
-		bgp_process(bgp, bn, new, afi, SAFI_UNICAST);
+		bgp_process(bgp, bn, new, afi, safi);
 		bgp_dest_unlock_node(bn);
 
-		if ((bgp->inst_type == BGP_INSTANCE_TYPE_VRF)
-		    || (bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
-
-			vpn_leak_from_vrf_update(bgp_get_default(), bgp, new);
+		if (safi == SAFI_UNICAST) {
+			if (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+			    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)
+				vpn_leak_from_vrf_update(bgp_get_default(), bgp, new);
+			if (advertise_type5_routes_multipath(bgp, afi) &&
+			    is_route_injectable_into_evpn(bgp, afi, safi, new))
+				bgp_evpn_export_type5_route(bgp, bn, new, afi, safi);
+			if (bgp->ls_info && bgp->ls_info->enable_distribution)
+				bgp_ls_originate_bgp_prefix(bgp, afi, safi, bn, new);
 		}
-		if (advertise_type5_routes_multipath(bgp, afi) &&
-		    is_route_injectable_into_evpn(bgp, afi, SAFI_UNICAST, new))
-			bgp_evpn_export_type5_route(bgp, bn, new, afi, SAFI_UNICAST);
-
-		if (bgp->ls_info && bgp->ls_info->enable_distribution)
-			bgp_ls_originate_bgp_prefix(bgp, afi, SAFI_UNICAST, bn, new);
 	}
 
+done:
 	/* Unintern original. */
 	aspath_unintern(&attr.aspath);
+}
+
+static void bgp_redistribute_one_delete(struct bgp *bgp, struct bgp_redist *red, struct prefix *p,
+					afi_t afi, uint8_t type, unsigned short instance)
+{
+	safi_t safi = red->safi;
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi;
+
+	dest = bgp_afi_node_get(bgp->rib[afi][safi], afi, safi, p, NULL);
+
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+		if (pi->peer == bgp->peer_self && pi->type == type && pi->instance == instance)
+			break;
+
+	if (pi) {
+		if (safi == SAFI_UNICAST) {
+			if (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+			    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)
+				vpn_leak_from_vrf_withdraw(bgp_get_default(), bgp, pi);
+			if (advertise_type5_routes_multipath(bgp, afi) &&
+			    is_route_injectable_into_evpn(bgp, afi, safi, pi))
+				bgp_evpn_unexport_type5_route(bgp, dest, pi, afi, safi);
+			bgp_ls_withdraw_bgp_prefix(bgp, afi, safi, dest, pi);
+		}
+
+		bgp_aggregate_decrement(bgp, p, pi, afi, safi);
+		bgp_path_info_mark_for_delete(dest, pi);
+		bgp_process(bgp, dest, pi, afi, safi);
+	}
+	bgp_dest_unlock_node(dest);
 }
 
 void bgp_redistribute_delete(struct bgp *bgp, struct prefix *p, uint8_t type,
 			     unsigned short instance)
 {
 	afi_t afi;
-	struct bgp_dest *dest;
-	struct bgp_path_info *pi;
+	struct list *red_list;
+	struct listnode *node;
 	struct bgp_redist *red;
 
 	afi = family2afi(p->family);
@@ -12117,44 +12159,26 @@ void bgp_redistribute_delete(struct bgp *bgp, struct prefix *p, uint8_t type,
 	/* Handle BGP-LS concerns including SRv6 localsid updates */
 	bgp_ls_handle_route_delete(bgp, p, afi, type, instance);
 
-	red = bgp_redist_lookup(bgp, afi, type, instance);
-	if (red) {
-		dest = bgp_afi_node_get(bgp->rib[afi][SAFI_UNICAST], afi,
-					SAFI_UNICAST, p, NULL);
+	red_list = bgp->redist[afi][type];
+	if (!red_list)
+		return;
 
-		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
-			if (pi->peer == bgp->peer_self && pi->type == type)
-				break;
-
-		if (pi) {
-			if ((bgp->inst_type == BGP_INSTANCE_TYPE_VRF)
-			    || (bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
-
-				vpn_leak_from_vrf_withdraw(bgp_get_default(),
-							   bgp, pi);
-			}
-			if (advertise_type5_routes_multipath(bgp, afi) &&
-			    is_route_injectable_into_evpn(bgp, afi, SAFI_UNICAST, pi))
-				bgp_evpn_unexport_type5_route(bgp, dest, pi, afi, SAFI_UNICAST);
-
-			bgp_ls_withdraw_bgp_prefix(bgp, afi, SAFI_UNICAST, dest, pi);
-			bgp_aggregate_decrement(bgp, p, pi, afi, SAFI_UNICAST);
-			bgp_path_info_mark_for_delete(dest, pi);
-			bgp_process(bgp, dest, pi, afi, SAFI_UNICAST);
-		}
-		bgp_dest_unlock_node(dest);
-	}
+	for (ALL_LIST_ELEMENTS_RO(red_list, node, red))
+		if (red->instance == instance)
+			bgp_redistribute_one_delete(bgp, red, p, afi, type, instance);
 }
 
 /* Withdraw specified route type's route. */
-void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, int type,
+void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, safi_t safi, int type,
 			       unsigned short instance)
 {
 	struct bgp_dest *dest;
 	struct bgp_path_info *pi;
 	struct bgp_table *table;
 
-	table = bgp->rib[afi][SAFI_UNICAST];
+	table = bgp->rib[afi][safi];
+	if (!table)
+		return;
 
 	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
 		if (dest->srv6_unicast)
@@ -12166,23 +12190,21 @@ void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, int type,
 				break;
 
 		if (pi) {
-			if ((bgp->inst_type == BGP_INSTANCE_TYPE_VRF)
-			    || (bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
-
-				vpn_leak_from_vrf_withdraw(bgp_get_default(),
-							   bgp, pi);
+			if (safi == SAFI_UNICAST) {
+				if (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+				    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)
+					vpn_leak_from_vrf_withdraw(bgp_get_default(), bgp, pi);
+				if (advertise_type5_routes_multipath(bgp, afi) &&
+				    is_route_injectable_into_evpn(bgp, afi, safi, pi))
+					bgp_evpn_unexport_type5_route(bgp, dest, pi, afi, safi);
+				bgp_ls_withdraw_bgp_prefix(bgp, afi, safi, dest, pi);
 			}
-			if (advertise_type5_routes_multipath(bgp, afi) &&
-			    is_route_injectable_into_evpn(bgp, afi, SAFI_UNICAST, pi))
-				bgp_evpn_unexport_type5_route(bgp, dest, pi, afi, SAFI_UNICAST);
 
-			bgp_ls_withdraw_bgp_prefix(bgp, afi, SAFI_UNICAST, dest, pi);
-			bgp_aggregate_decrement(bgp, bgp_dest_get_prefix(dest),
-						pi, afi, SAFI_UNICAST);
+			bgp_aggregate_decrement(bgp, bgp_dest_get_prefix(dest), pi, afi, safi);
 			bgp_path_info_mark_for_delete(dest, pi);
 			if (!CHECK_FLAG(bgp->flags,
 					BGP_FLAG_DELETE_IN_PROGRESS))
-				bgp_process(bgp, dest, pi, afi, SAFI_UNICAST);
+				bgp_process(bgp, dest, pi, afi, safi);
 			else {
 				dest = bgp_path_info_reap(dest, pi);
 				assert(dest);
