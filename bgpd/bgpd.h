@@ -285,6 +285,13 @@ struct bgp_rmap {
 };
 
 struct bgp_redist {
+	/* SAFI under which this redistribution was configured.  The
+	 * `bgp->redist[afi][type]` list multiplexes per-SAFI entries so
+	 * the same `(afi, type, instance)` triple can be configured under
+	 * multiple address-families (e.g. ipv4 unicast and ipv4 mup).
+	 */
+	safi_t safi;
+
 	unsigned short instance;
 
 	/* BGP redistribute metric configuration. */
