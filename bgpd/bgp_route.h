@@ -848,8 +848,8 @@ extern void bgp_redistribute_add(struct bgp *bgp, struct prefix *p,
 				 route_tag_t tag);
 extern void bgp_redistribute_delete(struct bgp *bgp, struct prefix *p, uint8_t type,
 				    unsigned short instance);
-extern void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, int type,
-				      unsigned short instance);
+extern void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, safi_t safi,
+				      int type, unsigned short instance);
 
 extern void bgp_static_add(struct bgp *bgp);
 extern void bgp_static_delete(struct bgp *bgp);

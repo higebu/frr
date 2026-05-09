@@ -859,7 +859,7 @@ void add_vnc_route(struct rfapi_descriptor *rfd, /* cookie, VPN UN addr, peer */
 	 *  aspath: points to interned hash from aspath hash table
 	 */
 
-	red = bgp_redist_lookup(bgp, afi, type, 0);
+	red = bgp_redist_lookup(bgp, afi, SAFI_UNICAST, type, 0);
 
 	if (red && red->redist_metric_flag)
 		bgp_attr_set_med(&attr, red->redist_metric);
