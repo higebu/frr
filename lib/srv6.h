@@ -520,6 +520,8 @@ const char *seg6local_action2str_with_next_csid(uint32_t action, bool has_next_c
 const char *
 seg6local_action2str(uint32_t action);
 
+const char *seg6_mobile_action2str(uint32_t action);
+
 const char *seg6local_context2str(char *str, size_t size,
 				  const struct seg6local_context *ctx,
 				  uint32_t action);

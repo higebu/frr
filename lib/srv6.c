@@ -62,6 +62,28 @@ const char *seg6local_action2str(uint32_t action)
 	return seg6local_action2str_with_next_csid(action, false);
 }
 
+const char *seg6_mobile_action2str(uint32_t action)
+{
+	switch (action) {
+	case ZEBRA_SEG6_MOBILE_ACTION_END_MAP:
+		return "End.MAP";
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP4_E:
+		return "End.M.GTP4.E";
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_E:
+		return "End.M.GTP6.E";
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D:
+		return "End.M.GTP6.D";
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D_DI:
+		return "End.M.GTP6.D.Di";
+	case ZEBRA_SEG6_MOBILE_ACTION_H_M_GTP4_D:
+		return "H.M.GTP4.D";
+	case ZEBRA_SEG6_MOBILE_ACTION_UNSPEC:
+		return "unspec";
+	default:
+		return "unknown";
+	}
+}
+
 int snprintf_seg6_segs(char *str,
 		size_t size, const struct seg6_segs *segs)
 {
