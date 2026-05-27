@@ -39,14 +39,15 @@ enum bgp_mup_policy_dir {
 	BGP_MUP_POLICY_DIR_MAX = 2,
 };
 
-/* Per-(vrf, afi) MUP policy.  Carries the import/export RT lists and the
+/* Per-(vrf, afi) MUP policy.  Carries the import/export RT lists, the
  * SR-underlay VRF table id used by both the install path (post-action
  * lookup for End.M.GTP6.D{,Di} / H.M.GTP4.D) and the originate path
- * (post-action lookup for End.M.GTP4.E / End.M.GTP6.E local SIDs).
- * Later commits grow the struct with RD, SID, segment, and scalar-DSD
- * knobs as the originate path lands.  Mirrors L3VPN's vpn_policy[afi]
- * one slot at a time so a vrf doing both L3VPN and MUP can keep the two
- * policies independent.
+ * (post-action lookup for End.M.GTP4.E / End.M.GTP6.E local SIDs), the
+ * RD and SRv6 SID slots that ISD origination consumes, the per-policy
+ * locator pin, the originate-side next-hop, the import/export
+ * route-map slots, and the scalar DSD origination knobs.  Mirrors
+ * L3VPN's vpn_policy[afi] so a vrf doing both L3VPN and MUP can keep
+ * the two policies independent.
  */
 struct bgp_mup_export_policy {
 	struct ecommunity *rtlist[BGP_MUP_POLICY_DIR_MAX];
@@ -57,6 +58,53 @@ struct bgp_mup_export_policy {
 	 * `segment vrftable TABLEID` under `address-family ipv[46] mup`.
 	 */
 	uint32_t vrftable;
+
+	uint32_t flags;
+#define BGP_MUP_EXPORT_POLICY_RD_SET		(1 << 0)
+#define BGP_MUP_EXPORT_POLICY_NEXTHOP_SET	(1 << 1)
+#define BGP_MUP_EXPORT_POLICY_SID_AUTO		(1 << 2)
+#define BGP_MUP_EXPORT_POLICY_SID_EXPLICIT	(1 << 3)
+#define BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK (1 << 4)
+#define BGP_MUP_EXPORT_POLICY_SEGMENT_DIRECT	(1 << 5)
+#define BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET	(1 << 6)
+
+	/* RD attached to ISD/DSD originated from this (vrf, afi). */
+	char *tovpn_rd_pretty;
+	struct prefix_rd tovpn_rd;
+
+	/* SRv6 SID used as the End.M.GTP4.E / End.M.GTP6.E local SID for
+	 * ISD origination.  tovpn_sid is filled by the SID manager when
+	 * SID_AUTO is set; tovpn_sid_explicit holds the operator value
+	 * when SID_EXPLICIT is set.  Both are dynamic so the SID manager
+	 * release path can NULL them on locator delete.
+	 */
+	struct in6_addr *tovpn_sid;
+	struct in6_addr *tovpn_sid_explicit;
+	/* Cached locator the SID was carved out of (per-policy pin). */
+	struct srv6_locator *tovpn_sid_locator;
+	/* Operator-supplied locator NAME override; takes precedence over
+	 * the bgp-instance default locator when allocating a SID.
+	 */
+	char *locator_name;
+
+	/* Next-hop carried in the originated MP_REACH attribute. */
+	struct prefix tovpn_nexthop;
+
+	/* Import/export route-map plumbing (TOMUP filters the per-vrf
+	 * unicast leak; FROMMUP gates the receive-side install).
+	 */
+	char *rmap_name[BGP_MUP_POLICY_DIR_MAX];
+	struct route_map *rmap[BGP_MUP_POLICY_DIR_MAX];
+
+	/* Scalar DSD origination ("segment direct" sub-block).  One DSD
+	 * record per (vrf, afi); the address/behavior/segment-id triple
+	 * is converted into a DSD NLRI emitted alongside ISD discovery.
+	 */
+	struct ipaddr dsd_address;
+	uint16_t dsd_behavior; /* SRV6_ENDPOINT_BEHAVIOR_END_DT4/6/46 */
+	uint32_t dsd_mup_as;
+	uint32_t dsd_mup_val;
+	char *dsd_mup_str;
 };
 
 static struct bgp_mup_export_policy *bgp_mup_export_get(struct bgp *bgp, afi_t afi)
@@ -89,7 +137,21 @@ void bgp_mup_export_clear(struct bgp *bgp, afi_t afi)
 	for (dir = 0; dir < BGP_MUP_POLICY_DIR_MAX; ++dir) {
 		if (p->rtlist[dir])
 			ecommunity_free(&p->rtlist[dir]);
+		XFREE(MTYPE_BGP_NAME, p->rmap_name[dir]);
+		/* p->rmap[dir] is owned by the route_map subsystem; just
+		 * drop the cached resolution pointer here.
+		 */
+		p->rmap[dir] = NULL;
 	}
+	XFREE(MTYPE_BGP_NAME, p->tovpn_rd_pretty);
+	XFREE(MTYPE_BGP_SRV6_SID, p->tovpn_sid);
+	XFREE(MTYPE_BGP_SRV6_SID, p->tovpn_sid_explicit);
+	/* tovpn_sid_locator points into bgp->srv6_locators (or the
+	 * per-policy locator entry owned elsewhere); never freed here.
+	 */
+	p->tovpn_sid_locator = NULL;
+	XFREE(MTYPE_BGP_NAME, p->locator_name);
+	XFREE(MTYPE_BGP_NAME, p->dsd_mup_str);
 	XFREE(MTYPE_BGP_MUP_EXPORT, bgp->mup_export[afi]);
 }
 
