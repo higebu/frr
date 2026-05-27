@@ -50,6 +50,14 @@ enum bgp_mup_policy_dir {
  * L3VPN's vpn_policy[afi] so a vrf doing both L3VPN and MUP can keep
  * the two policies independent.
  */
+/* The kernel has no default for the Source UPF Prefix length: it has to
+ * match the node on the other end, so a guess would fail silently on the
+ * wire.  Default to the length RFC 9433 Figure 10 leaves once the IPv4
+ * address and Args.Mob.Session are accounted for, and show it in the
+ * running configuration so the value in use is never invisible.
+ */
+#define BGP_MUP_SOURCE_UPF_PREFIX_LEN_DEFAULT 56
+
 struct bgp_mup_export_policy {
 	struct ecommunity *rtlist[BGP_MUP_POLICY_DIR_MAX];
 
@@ -61,6 +69,7 @@ struct bgp_mup_export_policy {
 #define BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK (1 << 4)
 #define BGP_MUP_EXPORT_POLICY_SEGMENT_DIRECT	(1 << 5)
 #define BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET	(1 << 6)
+#define BGP_MUP_EXPORT_POLICY_SOURCE_UPF_PREFIX_LEN_SET (1 << 7)
 
 	/* RD attached to ISD/DSD originated from this (vrf, afi). */
 	char *tovpn_rd_pretty;
@@ -99,6 +108,13 @@ struct bgp_mup_export_policy {
 	uint32_t dsd_mup_as;
 	uint32_t dsd_mup_val;
 	char *dsd_mup_str;
+
+	/* Length of the RFC 9433 Figure 10 Source UPF Prefix for the outer
+	 * IPv6 SA of T1ST installs into this (vrf, afi).  The prefix itself
+	 * is this speaker's SRv6 locator; the T1ST IPv4 Source Address goes
+	 * right after these bits, where the far End.M.GTP4.E reads it.
+	 */
+	uint8_t source_upf_prefix_len;
 };
 
 static struct bgp_mup_export_policy *bgp_mup_export_get(struct bgp *bgp, afi_t afi)
@@ -1640,6 +1656,23 @@ static bool bgp_mup_synthesize_t1st_sid(const struct bgp_mup_isd_entry *isd,
 	return true;
 }
 
+/* Lay out an outer IPv6 source per RFC 9433 Section 6.6 Figure 10: keep
+ * @plen bits of the Source UPF Prefix already in @sa, put @v4 right
+ * after them, and clear the trailing bits the behavior ignores.
+ */
+static void bgp_mup_source_upf_sa(struct in6_addr *sa, uint8_t plen, struct in_addr v4)
+{
+	uint8_t byte = plen / 8;
+	uint8_t bit = plen % 8;
+
+	if (bit) {
+		sa->s6_addr[byte] &= (uint8_t)(0xff << (8 - bit));
+		byte++;
+	}
+	memset(&sa->s6_addr[byte], 0, sizeof(sa->s6_addr) - byte);
+	bgp_mup_sid_set_bits(sa, plen, 32, ntohl(v4.s_addr));
+}
+
 /* T1ST resolution result.  Synthesized End.M.GTP*.E SID + outer IPv6
  * source for the new SRv6 packet (T1ST.source_address if present, else
  * a locally configured fallback).
@@ -1650,7 +1683,9 @@ struct bgp_mup_t1st_resolved {
 	bool have_outer_sa;
 };
 
-static bool bgp_mup_resolve_t1st(struct bgp *bgp, const struct bgp_mup_t1st_arch *ext,
+static bool bgp_mup_resolve_t1st(struct bgp *bgp, const struct bgp_mup_export_policy *ep,
+				 const struct srv6_locator *loc,
+				 const struct bgp_mup_t1st_arch *ext,
 				 struct bgp_mup_t1st_resolved *out)
 {
 	struct bgp_mup_isd_entry *isd;
@@ -1677,17 +1712,26 @@ static bool bgp_mup_resolve_t1st(struct bgp *bgp, const struct bgp_mup_t1st_arch
 		out->have_outer_sa = true;
 	} else if (ext->source_address_length == 32) {
 		/* RFC 9433 Section 6.6 Figure 10: Source UPF Prefix, then the
-		 * IPv4 SA, then bits End.M.GTP4.E ignores.  The prefix is
-		 * the SR-domain source this speaker would use anyway, cut
-		 * at /64 to match the End.M.GTP4.E default extraction
-		 * offset.
+		 * IPv4 SA, then bits End.M.GTP4.E ignores.  The prefix is this
+		 * speaker's SRv6 locator, so the address the far gateway
+		 * answers to routes back here; `source-upf-prefix-len` says
+		 * how much of it precedes the IPv4 SA, and must match the
+		 * gateway's extraction offset.
 		 */
-		if (bgp_mup_local_v6_source(bgp->vrf_id, &out->outer_sa)) {
-			memset(&out->outer_sa.s6_addr[8], 0, 8);
-			bgp_mup_sid_set_bits(&out->outer_sa, 64, 32,
-					     ntohl(ext->source_address.ipaddr_v4.s_addr));
+		uint8_t plen = BGP_MUP_SOURCE_UPF_PREFIX_LEN_DEFAULT;
+
+		if (ep && CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SOURCE_UPF_PREFIX_LEN_SET))
+			plen = ep->source_upf_prefix_len;
+
+		if (loc) {
+			out->outer_sa = loc->prefix.prefix;
+			out->have_outer_sa = true;
+		} else if (bgp_mup_local_v6_source(bgp->vrf_id, &out->outer_sa)) {
 			out->have_outer_sa = true;
 		}
+		if (out->have_outer_sa)
+			bgp_mup_source_upf_sa(&out->outer_sa, plen,
+					      ext->source_address.ipaddr_v4);
 	}
 	if (!out->have_outer_sa) {
 		if (bgp_mup_local_v6_source(bgp->vrf_id, &out->outer_sa))
@@ -1806,6 +1850,22 @@ static void bgp_mup_build_t2st_route(struct bgp *bgp, const struct mup_prefix *m
 	api_nh->vrf_id = vrf_id;
 	api_nh->seg6_mobile_action = ep_v4 ? ZEBRA_SEG6_MOBILE_ACTION_H_M_GTP4_D
 					   : ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D;
+	if (ep_v4) {
+		/* H.M.GTP4.D writes the outer IPv6 source that the far
+		 * End.M.GTP4.E reads back per RFC 9433 Section 6.6 Figure 10,
+		 * so both ends have to agree on where the IPv4 sits.  The
+		 * GTP6 sibling has no such field and the kernel rejects the
+		 * attribute there.
+		 */
+		struct bgp *vrf_bgp = bgp_lookup_by_vrf_id(vrf_id);
+		struct bgp_mup_export_policy *vep =
+			vrf_bgp ? bgp_mup_export_peek(vrf_bgp, AFI_IP) : NULL;
+
+		api_nh->seg6_mobile_ctx.v6_src_prefix_len =
+			(vep && vep->source_upf_prefix_len)
+				? vep->source_upf_prefix_len
+				: BGP_MUP_SOURCE_UPF_PREFIX_LEN_DEFAULT;
+	}
 	/* Both H.M.GTP4.D (v4) and End.M.GTP6.D (v6) carry the SR Policy as a
 	 * single-segment SRH = [DSD SID]; the kernel reads segments[0] as the
 	 * outer DA base.  H.M.GTP4.D overlays the 32-bit inner IPv4 DA right
@@ -2235,11 +2295,16 @@ static int bgp_mup_st_announce(struct bgp_dest *dest, struct bgp_path_info *info
 	}
 
 	if (mp->route_type == BGP_MUP_T1ST_ROUTE) {
+		struct bgp *vrf_bgp = bgp_lookup_by_vrf_id(install_vrf_id);
+		const struct bgp_mup_export_policy *ep =
+			vrf_bgp ? bgp_mup_export_peek(vrf_bgp, afi) : NULL;
+		const struct srv6_locator *loc =
+			vrf_bgp ? bgp_srv6_locator_lookup(vrf_bgp, bgp_get_default()) : NULL;
 		struct bgp_mup_t1st_resolved r;
 		struct bgp_mup_t1st_arch ext;
 
 		if (!bgp_mup_t1st_arch_decode(info->attr, &ext) ||
-		    !bgp_mup_resolve_t1st(bgp, &ext, &r)) {
+		    !bgp_mup_resolve_t1st(bgp, ep, loc, &ext, &r)) {
 			/* Withdraw any prior install for this T1ST: an ISD
 			 * may have been removed or the source-address
 			 * resolution failed.  Idempotent if nothing was
@@ -2601,9 +2666,9 @@ done:
 
 static afi_t bgp_mup_export_node2afi(struct vty *vty)
 {
-	if (vty->node == BGP_IPV4_NODE)
+	if (vty->node == BGP_MUPV4_NODE)
 		return AFI_IP;
-	if (vty->node == BGP_IPV6_NODE)
+	if (vty->node == BGP_MUPV6_NODE)
 		return AFI_IP6;
 	return AFI_MAX;
 }
@@ -2612,12 +2677,12 @@ static int bgp_mup_export_check_ctx(struct vty *vty, struct bgp *bgp, afi_t afi)
 {
 	if (afi == AFI_MAX) {
 		vty_out(vty,
-			"%% rt mup only valid under address-family ipv4|ipv6 unicast\n");
+			"%% BGP-MUP origination knobs only valid under address-family ipv4|ipv6 mup\n");
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 	if (bgp->vrf_id == VRF_DEFAULT) {
 		vty_out(vty,
-			"%% rt mup must be configured under a non-default vrf bgp instance (`router bgp ASN vrf NAME`); the default-vrf instance only carries the BGP-MUP session\n");
+			"%% BGP-MUP origination knobs must be configured under a non-default vrf bgp instance (`router bgp ASN vrf NAME`); the default-vrf instance only carries the BGP-MUP session\n");
 		return CMD_WARNING_CONFIG_FAILED;
 	}
 	return CMD_SUCCESS;
@@ -2641,8 +2706,8 @@ static int mup_policy_getdirs(struct vty *vty, const char *dstr, int *dodir)
 
 /* True iff the per-(vrf, afi) MUP import policy currently has any
  * matching state (rtlist[FROMMUP] non-NULL).  Used by the auto-set
- * of BGP_CONFIG_MUP_TO_VRF_IMPORT on the first `rt mup import` line:
- * existing seg6-mobile configs with `rt mup import` but no explicit
+ * of BGP_CONFIG_MUP_TO_VRF_IMPORT on the first `rt import` line:
+ * existing seg6-mobile configs with `rt import` but no explicit
  * `import mup` toggle continue to install received MUP NLRIs.
  */
 static bool bgp_mup_import_predicted_active(struct bgp *bgp, afi_t afi)
@@ -2674,22 +2739,20 @@ static void bgp_mup_import_autoset(struct bgp *bgp, afi_t afi)
 	SET_FLAG(bgp->af_flags[afi][SAFI_UNICAST], BGP_CONFIG_MUP_TO_VRF_IMPORT);
 }
 
-/* `rt mup <import|export|both> RTLIST` under
- * `address-family ipv[46] unicast` - BGP-MUP analogue of L3VPN's
- * `rt vpn <import|export|both>` (af_rt_vpn_imexport_cmd in bgp_vty.c).
- * Stored on the per-vrf bgp instance and consulted by
- * bgp_mup_match_install_vrf and the ISD/DSD cache upsert paths via
- * the FROMMUP slot.  TOMUP feeds the originate path landed in a later
- * commit.
+/* `rt <import|export|both> RTLIST` under `address-family ipv[46] mup`
+ * - BGP-MUP analogue of L3VPN's `rt vpn <import|export|both>`.  Stored
+ * on the per-vrf bgp instance and consulted by
+ * bgp_mup_match_install_vrf and the ISD/DSD cache upsert paths via the
+ * FROMMUP slot; the TOMUP slot is the export RT stamped on originated
+ * ISD/DSD NLRIs.
  */
 DEFPY (af_rt_mup,
        af_rt_mup_cmd,
-       "[no] rt mup <import|export|both>$direction_str RTLIST...",
+       "[no] rt <import|export|both>$direction_str RTLIST...",
        NO_STR
        "Specify route target list\n"
-       "Between current address-family and BGP-MUP\n"
-       "For routes leaked from BGP-MUP into current unicast address-family: match any\n"
-       "For routes leaked from current unicast address-family to BGP-MUP: set\n"
+       "For received BGP-MUP routes matched for install into this vrf: match any\n"
+       "For locally-originated BGP-MUP routes: set\n"
        "both import: match any and export: set\n"
        "Space separated route target list (A.B.C.D:MN|EF:OPQR|GHJK:MN)\n")
 {
@@ -2771,42 +2834,267 @@ DEFPY (af_rt_mup,
 
 ALIAS (af_rt_mup,
        af_no_rt_mup_cmd,
-       "no rt mup <import|export|both>$direction_str",
+       "no rt <import|export|both>$direction_str",
        NO_STR
        "Specify route target list\n"
-       "Between current address-family and BGP-MUP\n"
-       "For routes leaked from BGP-MUP into current unicast address-family\n"
-       "For routes leaked from current unicast address-family to BGP-MUP\n"
+       "For received BGP-MUP routes matched for install into this vrf\n"
+       "For locally-originated BGP-MUP routes\n"
        "both import and export\n")
+
+/* `rd ASN:NN|IP:NN` under `address-family ipv[46] mup` - BGP-MUP
+ * analogue of L3VPN's `rd vpn export`.  Sets the RD that origination
+ * stamps on ISD/DSD NLRIs originated from this (vrf, afi).
+ */
+DEFPY (af_rd_mup,
+       af_rd_mup_cmd,
+       "[no] rd ASN:NN_OR_IP-ADDRESS:NN$rd_str",
+       NO_STR
+       "Specify route distinguisher\n"
+       "Route Distinguisher (<as-number>:<number> | <ip-address>:<number>)\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	struct prefix_rd prd;
+	int idx = 0;
+	bool yes = !argv_find(argv, argc, "no", &idx);
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	if (yes) {
+		if (!str2prefix_rd(rd_str, &prd)) {
+			vty_out(vty, "%% Malformed rd\n");
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+	}
+
+	ep = bgp_mup_export_get(bgp, afi);
+	XFREE(MTYPE_BGP_NAME, ep->tovpn_rd_pretty);
+	if (yes) {
+		ep->tovpn_rd_pretty = XSTRDUP(MTYPE_BGP_NAME, rd_str);
+		ep->tovpn_rd = prd;
+		SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_RD_SET);
+	} else {
+		memset(&ep->tovpn_rd, 0, sizeof(ep->tovpn_rd));
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_RD_SET);
+	}
+	return CMD_SUCCESS;
+}
+
+ALIAS (af_rd_mup,
+       af_no_rd_mup_cmd,
+       "no rd",
+       NO_STR
+       "Specify route distinguisher\n")
+
+/* `sid <auto|explicit X:X::X:X> [locator NAME]` under
+ * `address-family ipv[46] mup` - BGP-MUP analogue of L3VPN's
+ * `sid vpn export`.  Selects the SRv6 SID used as the End.M.GTP4.E /
+ * End.M.GTP6.E local SID for ISD origination.  The optional
+ * `locator NAME` overrides the bgp-instance default locator for this
+ * (vrf, afi).
+ */
+DEFPY (af_sid_mup,
+       af_sid_mup_cmd,
+       "[no] sid <auto$sid_auto|explicit$sid_explicit X:X::X:X$sid_value> [locator WORD$locator_name]",
+       NO_STR
+       "SID value for BGP-MUP\n"
+       "Automatically assign a SID from the bgp-instance SRv6 locator\n"
+       "Explicitly assign a SID value\n"
+       "SID value\n"
+       "Allocate the SID from a named SRv6 locator instead of the bgp default\n"
+       "Locator name\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int idx = 0;
+	bool yes = !argv_find(argv, argc, "no", &idx);
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	ep = bgp_mup_export_get(bgp, afi);
+
+	if (!yes) {
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_AUTO);
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_EXPLICIT);
+		XFREE(MTYPE_BGP_SRV6_SID, ep->tovpn_sid_explicit);
+		XFREE(MTYPE_BGP_SRV6_SID, ep->tovpn_sid);
+		ep->tovpn_sid_locator = NULL;
+		XFREE(MTYPE_BGP_NAME, ep->locator_name);
+		return CMD_SUCCESS;
+	}
+
+	if (sid_auto && sid_explicit) {
+		vty_out(vty, "%% auto and explicit are mutually exclusive\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	if (sid_auto) {
+		SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_AUTO);
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_EXPLICIT);
+		XFREE(MTYPE_BGP_SRV6_SID, ep->tovpn_sid_explicit);
+	} else {
+		struct in6_addr *sid;
+
+		SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_EXPLICIT);
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_AUTO);
+		if (!ep->tovpn_sid_explicit)
+			ep->tovpn_sid_explicit = XCALLOC(MTYPE_BGP_SRV6_SID,
+							 sizeof(struct in6_addr));
+		sid = ep->tovpn_sid_explicit;
+		*sid = sid_value;
+	}
+
+	XFREE(MTYPE_BGP_NAME, ep->locator_name);
+	if (locator_name)
+		ep->locator_name = XSTRDUP(MTYPE_BGP_NAME, locator_name);
+	return CMD_SUCCESS;
+}
+
+ALIAS (af_sid_mup,
+       af_no_sid_mup_cmd,
+       "no sid",
+       NO_STR
+       "SID value for BGP-MUP\n")
+
+/* `source-upf-prefix-len M` under `address-family ipv[46] mup` - how
+ * many bits of the Source UPF Prefix (RFC 9433 Section 6.6 Figure 10)
+ * precede the IPv4 Source Address in the outer IPv6 source of T1ST
+ * installs.  The prefix itself is this speaker's SRv6 locator; only
+ * the length has to be agreed with the gateway that reads the IPv4
+ * back out.
+ */
+DEFPY (af_source_upf_prefix_len_mup,
+       af_source_upf_prefix_len_mup_cmd,
+       "[no] source-upf-prefix-len [(1-96)$plen]",
+       NO_STR
+       "Bits of the Source UPF Prefix preceding the IPv4 Source Address\n"
+       "Prefix length; must match the gateway extraction offset\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	struct listnode *node;
+	struct bgp *b;
+	int idx = 0;
+	bool yes = !argv_find(argv, argc, "no", &idx);
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	if (yes && !plen_str) {
+		vty_out(vty, "%% Prefix length required\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	ep = bgp_mup_export_get(bgp, afi);
+	if (yes) {
+		ep->source_upf_prefix_len = plen;
+		SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SOURCE_UPF_PREFIX_LEN_SET);
+	} else {
+		ep->source_upf_prefix_len = 0;
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SOURCE_UPF_PREFIX_LEN_SET);
+	}
+
+	/* T1ST already installed into this vrf carry the old source. */
+	for (ALL_LIST_ELEMENTS_RO(bm->bgp, node, b))
+		bgp_mup_schedule_reannounce_st_routes(b, afi);
+	return CMD_SUCCESS;
+}
+
+/* `nexthop <A.B.C.D|X:X::X:X>` under `address-family ipv[46] mup` -
+ * BGP-MUP analogue of L3VPN's `nexthop vpn export`.  Sets the next-hop
+ * that origination stamps on the MP_REACH attribute for ISD/DSD
+ * originated from this (vrf, afi).
+ */
+DEFPY (af_nexthop_mup,
+       af_nexthop_mup_cmd,
+       "[no] nexthop [<A.B.C.D|X:X::X:X>$nh_su]",
+       NO_STR
+       "Specify next-hop for BGP-MUP advertised prefixes\n"
+       "IPv4 next-hop\n"
+       "IPv6 next-hop\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	struct prefix p = {};
+	int idx = 0;
+	bool yes = !argv_find(argv, argc, "no", &idx);
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	if (yes) {
+		if (!nh_su) {
+			vty_out(vty, "%% Next-hop required\n");
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+		if (!sockunion2hostprefix(nh_su, &p))
+			return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	ep = bgp_mup_export_get(bgp, afi);
+	if (yes) {
+		ep->tovpn_nexthop = p;
+		SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_NEXTHOP_SET);
+	} else {
+		memset(&ep->tovpn_nexthop, 0, sizeof(ep->tovpn_nexthop));
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_NEXTHOP_SET);
+	}
+	return CMD_SUCCESS;
+}
 
 void bgp_mup_vty_init(void)
 {
-	install_element(BGP_IPV4_NODE, &af_rt_mup_cmd);
-	install_element(BGP_IPV4_NODE, &af_no_rt_mup_cmd);
-	install_element(BGP_IPV6_NODE, &af_rt_mup_cmd);
-	install_element(BGP_IPV6_NODE, &af_no_rt_mup_cmd);
+	install_element(BGP_MUPV4_NODE, &af_rt_mup_cmd);
+	install_element(BGP_MUPV4_NODE, &af_no_rt_mup_cmd);
+	install_element(BGP_MUPV6_NODE, &af_rt_mup_cmd);
+	install_element(BGP_MUPV6_NODE, &af_no_rt_mup_cmd);
+
+	install_element(BGP_MUPV4_NODE, &af_rd_mup_cmd);
+	install_element(BGP_MUPV4_NODE, &af_no_rd_mup_cmd);
+	install_element(BGP_MUPV6_NODE, &af_rd_mup_cmd);
+	install_element(BGP_MUPV6_NODE, &af_no_rd_mup_cmd);
+
+	install_element(BGP_MUPV4_NODE, &af_sid_mup_cmd);
+	install_element(BGP_MUPV4_NODE, &af_no_sid_mup_cmd);
+	install_element(BGP_MUPV6_NODE, &af_sid_mup_cmd);
+	install_element(BGP_MUPV6_NODE, &af_no_sid_mup_cmd);
+
+	install_element(BGP_MUPV4_NODE, &af_source_upf_prefix_len_mup_cmd);
+	install_element(BGP_MUPV6_NODE, &af_source_upf_prefix_len_mup_cmd);
+	install_element(BGP_MUPV4_NODE, &af_nexthop_mup_cmd);
+	install_element(BGP_MUPV6_NODE, &af_nexthop_mup_cmd);
 }
 
-/* Emit MUP-AF-scoped knobs under `address-family ipv[46] mup`. */
+/* Emit every per-(vrf, afi) BGP-MUP policy line under
+ * `address-family ipv[46] mup`.  Origination knobs (rd / rt / sid /
+ * nexthop) are written on the non-default vrf instance.  All BGP-MUP
+ * config is self-contained in the MUP AF; nothing is emitted under
+ * `address-family ipv[46] unicast`.
+ */
 void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi)
 {
-}
-
-/* Emit the per-(vrf, afi) MUP-policy lines under
- * `address-family ipv[46] unicast`.  Sibling of L3VPN's
- * `rt vpn <import|export|both>` writeback in
- * bgp_vpn_policy_config_write_afi.
- */
-void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, int indent)
-{
-	struct bgp_mup_export_policy *ep;
+	struct bgp_mup_export_policy *ep = bgp_mup_export_peek(bgp, afi);
 	struct ecommunity *rt_in, *rt_out;
 
-	if (afi != AFI_IP && afi != AFI_IP6)
-		return;
-	ep = bgp_mup_export_peek(bgp, afi);
 	if (!ep)
 		return;
+
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_RD_SET) && ep->tovpn_rd_pretty)
+		vty_out(vty, "  rd %s\n", ep->tovpn_rd_pretty);
 
 	rt_in = ep->rtlist[BGP_MUP_POLICY_DIR_FROMMUP];
 	rt_out = ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP];
@@ -2814,22 +3102,46 @@ void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, in
 		char *b = ecommunity_ecom2str(rt_in, ECOMMUNITY_FORMAT_ROUTE_MAP,
 					      ECOMMUNITY_ROUTE_TARGET);
 
-		vty_out(vty, "%*srt mup both %s\n", indent, "", b);
+		vty_out(vty, "  rt both %s\n", b);
 		XFREE(MTYPE_ECOMMUNITY_STR, b);
-		return;
-	}
-	if (rt_in) {
-		char *b = ecommunity_ecom2str(rt_in, ECOMMUNITY_FORMAT_ROUTE_MAP,
-					      ECOMMUNITY_ROUTE_TARGET);
+	} else {
+		if (rt_in) {
+			char *b = ecommunity_ecom2str(rt_in, ECOMMUNITY_FORMAT_ROUTE_MAP,
+						      ECOMMUNITY_ROUTE_TARGET);
 
-		vty_out(vty, "%*srt mup import %s\n", indent, "", b);
-		XFREE(MTYPE_ECOMMUNITY_STR, b);
-	}
-	if (rt_out) {
-		char *b = ecommunity_ecom2str(rt_out, ECOMMUNITY_FORMAT_ROUTE_MAP,
-					      ECOMMUNITY_ROUTE_TARGET);
+			vty_out(vty, "  rt import %s\n", b);
+			XFREE(MTYPE_ECOMMUNITY_STR, b);
+		}
+		if (rt_out) {
+			char *b = ecommunity_ecom2str(rt_out, ECOMMUNITY_FORMAT_ROUTE_MAP,
+						      ECOMMUNITY_ROUTE_TARGET);
 
-		vty_out(vty, "%*srt mup export %s\n", indent, "", b);
-		XFREE(MTYPE_ECOMMUNITY_STR, b);
+			vty_out(vty, "  rt export %s\n", b);
+			XFREE(MTYPE_ECOMMUNITY_STR, b);
+		}
+	}
+
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_AUTO)) {
+		if (ep->locator_name)
+			vty_out(vty, "  sid auto locator %s\n", ep->locator_name);
+		else
+			vty_out(vty, "  sid auto\n");
+	} else if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_EXPLICIT) &&
+		   ep->tovpn_sid_explicit) {
+		if (ep->locator_name)
+			vty_out(vty, "  sid explicit %pI6 locator %s\n", ep->tovpn_sid_explicit,
+				ep->locator_name);
+		else
+			vty_out(vty, "  sid explicit %pI6\n", ep->tovpn_sid_explicit);
+	}
+
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SOURCE_UPF_PREFIX_LEN_SET))
+		vty_out(vty, "  source-upf-prefix-len %u\n", ep->source_upf_prefix_len);
+
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_NEXTHOP_SET)) {
+		if (ep->tovpn_nexthop.family == AF_INET)
+			vty_out(vty, "  nexthop %pI4\n", &ep->tovpn_nexthop.u.prefix4);
+		else if (ep->tovpn_nexthop.family == AF_INET6)
+			vty_out(vty, "  nexthop %pI6\n", &ep->tovpn_nexthop.u.prefix6);
 	}
 }
