@@ -7,6 +7,7 @@
 #define _FRR_BGP_MUP_H
 
 #include "stream.h"
+#include "lib/srv6.h"
 
 #include "bgpd/bgpd.h"
 
@@ -68,6 +69,31 @@ extern void bgp_mup_caches_free(struct bgp *bgp);
 
 /* Free the per-(vrf, afi) MUP export policy (called from bgp_free). */
 extern void bgp_mup_export_clear(struct bgp *bgp, afi_t afi);
+
+/* SRv6 SID notify hook for the BGP-MUP origination path.  Returns
+ * true when the notification matches a per-(vrf, afi) MUP policy
+ * and has been consumed (the seg6_mobile-family local SID is now
+ * installed and the policy is armed for ISD emit).
+ */
+bool bgp_mup_handle_sid_alloc(struct bgp *bgp, const struct srv6_sid_ctx *ctx,
+			      const struct in6_addr *sid, const char *loc_name);
+
+/* Bgp-instance locator arrived (or was rebound): kick SID requests
+ * for every (vrf, afi) MUP policy whose ISD origination is set to
+ * SID_AUTO and has no SID pinned yet.
+ */
+void bgp_mup_locator_arrived(struct bgp *bgp);
+
+/* An `sid ... locator NAME` override locator arrived: cache it on the
+ * referencing MUP policies and re-kick their SID requests.
+ */
+void bgp_mup_override_locator_arrived(struct bgp *bgp, struct srv6_locator *locator);
+
+/* Bgp-instance locator was deleted: release every local-SID install
+ * that referenced @locator and drop the cached SID + ready latch on
+ * the corresponding (vrf, afi) policies.
+ */
+void bgp_mup_locator_delete_purge(struct bgp *bgp, const struct srv6_locator *locator);
 
 /* Emit BGP-MUP per-AFI commands under `address-family ipv4|ipv6 mup`
  * (placeholder for future SAFI-global knobs).  Called from bgp_vty.c.
