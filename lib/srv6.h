@@ -76,6 +76,21 @@ enum seg6local_action_t {
 	ZEBRA_SEG6_LOCAL_ACTION_END_DT46     = 16,
 };
 
+/* SRv6 Mobile User Plane (RFC 9433) behaviours, mirrored from the kernel
+ * UAPI enum SEG6_MOBILE_ACTION_* in linux/include/uapi/linux/seg6_mobile.h.
+ * Carried on a separate lwtunnel encap type (LWTUNNEL_ENCAP_SEG6_MOBILE),
+ * not as an extension of seg6_local.
+ */
+enum seg6_mobile_action_t {
+	ZEBRA_SEG6_MOBILE_ACTION_UNSPEC       = 0,
+	ZEBRA_SEG6_MOBILE_ACTION_END_MAP      = 1,
+	ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP4_E = 2,
+	ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_E = 3,
+	ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D = 4,
+	ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D_DI = 5,
+	ZEBRA_SEG6_MOBILE_ACTION_H_M_GTP4_D   = 6,
+};
+
 /* Flavor operations for SRv6 End* Behaviors */
 enum seg6local_flavor_op {
 	ZEBRA_SEG6_LOCAL_FLV_OP_UNSPEC       = 0,
@@ -126,6 +141,27 @@ struct seg6local_context {
 	uint8_t node_len;
 	uint8_t function_len;
 	uint8_t argument_len;
+};
+
+/* SRv6 Mobile User Plane lwtunnel inputs.  Field set mirrors the kernel
+ * SEG6_MOBILE_* attribute namespace in linux/include/uapi/linux/seg6_mobile.h;
+ * which subset is meaningful depends on the action.
+ */
+struct seg6_mobile_ctx {
+	/* PSA / encap source IPv6 address (SEG6_MOBILE_SRC_ADDR). */
+	struct in6_addr src_addr;
+	/* End.MAP next-hop SID (SEG6_MOBILE_NH6). */
+	struct in6_addr nh6;
+	/* Post-action FIB lookup table (SEG6_MOBILE_VRFTABLE).  Requires
+	 * net.vrf.strict_mode = 1 and a VRF device bound to the table.
+	 */
+	uint32_t vrftable;
+	/* SR service-prefix length, End.M.GTP6.D / H.M.GTP4.D. */
+	uint8_t sr_prefix_len;
+	/* IPv6 source-prefix length, End.M.GTP4.E. */
+	uint8_t v6_src_prefix_len;
+	/* PDU direction: 0 = downlink, 1 = uplink. */
+	uint8_t pdu_type;
 };
 
 struct srv6_locator {
@@ -312,7 +348,16 @@ struct nexthop_srv6 {
 	enum seg6local_action_t seg6local_action;
 	struct seg6local_context seg6local_ctx;
 
-	/* SRv6 Headend-behaviour */
+	/* SRv6 Mobile User Plane localsid info.  Mutually exclusive with
+	 * seg6local_action: at most one of the two is non-UNSPEC for a
+	 * given nexthop.
+	 */
+	enum seg6_mobile_action_t seg6_mobile_action;
+	struct seg6_mobile_ctx seg6_mobile_ctx;
+
+	/* SRv6 Headend-behaviour, also used as the SR Policy carrier for
+	 * End.M.GTP6.D / End.M.GTP6.D.Di.
+	 */
 	struct seg6_seg_stack *seg6_segs;
 };
 
