@@ -430,6 +430,22 @@ struct srv6_sid_ctx {
 	struct in6_addr nh6;
 	vrf_id_t vrf_id;
 	ifindex_t ifindex;
+
+	/* Behavior selector for SRv6 Mobile User Plane SIDs (RFC 9433),
+	 * which live in their own LWTUNNEL_ENCAP_SEG6_MOBILE family and
+	 * cannot be expressed in @behavior.  When set to a non-UNSPEC
+	 * value, @behavior is expected to stay UNSPEC and consumers
+	 * dispatch on @mobile_behavior instead.
+	 */
+	enum seg6_mobile_action_t mobile_behavior;
+
+	/* Address family the SID is requested on behalf of.  Lets two
+	 * consumers that share a behavior and a VRF (e.g. the L3VPN and
+	 * BGP-MUP End.DT4 of the same VRF) hold distinct SIDs.  UNSPEC
+	 * for callers that have no such notion.
+	 */
+	afi_t afi;
+	safi_t safi;
 };
 
 static inline const char *srv6_headend_behavior2str(enum srv6_headend_behavior behavior,
@@ -573,6 +589,12 @@ static inline const char *srv6_sid_ctx2str(char *str, size_t size,
 	case ZEBRA_SEG6_LOCAL_ACTION_END_BPF:
 	default:
 		snprintf(str + len, size - len, " unknown(%s)", __func__);
+	}
+
+	if (ctx->safi) {
+		len = strlen(str);
+		snprintf(str + len, size - len, " %s %s", afi2str(ctx->afi),
+			 safi2str(ctx->safi));
 	}
 
 	return str;
