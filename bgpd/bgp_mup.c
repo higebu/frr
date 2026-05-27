@@ -81,12 +81,26 @@ struct bgp_mup_export_policy {
 	 */
 	struct in6_addr *tovpn_sid;
 	struct in6_addr *tovpn_sid_explicit;
-	/* Cached locator the SID was carved out of (per-policy pin). */
+	/* Cached locator the SID was carved out of (per-policy pin).
+	 * Deep-copied so a subsequent locator delete can be reconciled
+	 * even after bgp->srv6_locator has been swapped or freed.
+	 */
 	struct srv6_locator *tovpn_sid_locator;
 	/* Operator-supplied locator NAME override; takes precedence over
 	 * the bgp-instance default locator when allocating a SID.
 	 */
 	char *locator_name;
+	/* True once the SID is ready to be advertised (tovpn_sid populated
+	 * and tovpn_sid_locator pinned).  ISD emit gates on this so the
+	 * advertised next-hop never refers to an unarmed SID.
+	 */
+	bool tovpn_sid_ready;
+	/* Fingerprint of the most recent zclient_send_localsid_mobile()
+	 * install.  Used to skip redundant ZAPI route_add when neither
+	 * the SID nor the action changes between two emit passes.
+	 */
+	struct in6_addr last_installed_sid;
+	enum seg6_mobile_action_t last_installed_act;
 
 	/* Next-hop carried in the originated MP_REACH attribute. */
 	struct prefix tovpn_nexthop;
@@ -115,6 +129,7 @@ static struct bgp_mup_export_policy *bgp_mup_export_get(struct bgp *bgp, afi_t a
 	if (bgp->mup_export[afi])
 		return bgp->mup_export[afi];
 	bgp->mup_export[afi] = XCALLOC(MTYPE_BGP_MUP_EXPORT, sizeof(*bgp->mup_export[afi]));
+	bgp->mup_export[afi]->last_installed_act = ZEBRA_SEG6_MOBILE_ACTION_UNSPEC;
 	return bgp->mup_export[afi];
 }
 
@@ -147,13 +162,252 @@ void bgp_mup_export_clear(struct bgp *bgp, afi_t afi)
 	XFREE(MTYPE_BGP_NAME, p->tovpn_rd_pretty);
 	XFREE(MTYPE_BGP_SRV6_SID, p->tovpn_sid);
 	XFREE(MTYPE_BGP_SRV6_SID, p->tovpn_sid_explicit);
-	/* tovpn_sid_locator points into bgp->srv6_locators (or the
-	 * per-policy locator entry owned elsewhere); never freed here.
-	 */
+	if (p->tovpn_sid_locator)
+		srv6_locator_free(p->tovpn_sid_locator);
 	p->tovpn_sid_locator = NULL;
 	XFREE(MTYPE_BGP_NAME, p->locator_name);
 	XFREE(MTYPE_BGP_NAME, p->dsd_mup_str);
 	XFREE(MTYPE_BGP_MUP_EXPORT, bgp->mup_export[afi]);
+}
+
+/* Map per-(vrf, afi) ISD origination to its SRv6 Mobile action: the
+ * AFI of the leaked prefix selects End.M.GTP4.E (IPv4) or
+ * End.M.GTP6.E (IPv6).
+ */
+static enum seg6_mobile_action_t bgp_mup_isd_action_for_afi(afi_t afi)
+{
+	if (afi == AFI_IP)
+		return ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP4_E;
+	if (afi == AFI_IP6)
+		return ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_E;
+	return ZEBRA_SEG6_MOBILE_ACTION_UNSPEC;
+}
+
+/* Resolve the locator NAME a (bgp, afi) policy expects its SID to
+ * be carved from.  Per-policy override (`sid ... locator NAME`)
+ * wins over the bgp-instance default (`segment-routing srv6 locator
+ * NAME` on the bgp instance).  Returns NULL when neither is set.
+ */
+static const char *bgp_mup_select_locator_name(const struct bgp *bgp,
+					       const struct bgp_mup_export_policy *ep)
+{
+	if (ep && ep->locator_name)
+		return ep->locator_name;
+	if (bgp && bgp->srv6_locator_name[0] != '\0')
+		return bgp->srv6_locator_name;
+	return NULL;
+}
+
+/* Install or uninstall the End.M.GTP*.E local SID for this (vrf,
+ * afi) policy.  Dedup against last_installed_* skips ZAPI traffic
+ * when neither the SID nor the action changed; locator delete uses
+ * @withdraw=true to release the install before the SID disappears.
+ */
+static void bgp_mup_install_isd_localsid(struct bgp *bgp, afi_t afi, bool withdraw)
+{
+	struct bgp_mup_export_policy *ep = bgp_mup_export_peek(bgp, afi);
+	struct seg6_mobile_ctx mctx = {};
+	struct srv6_locator *loc;
+	enum seg6_mobile_action_t act;
+	struct vrf *vrf;
+	ifindex_t oif;
+	uint16_t plen;
+	bool dedup;
+
+	if (!ep || !ep->tovpn_sid || !ep->tovpn_sid_locator)
+		return;
+	act = bgp_mup_isd_action_for_afi(afi);
+	if (act == ZEBRA_SEG6_MOBILE_ACTION_UNSPEC)
+		return;
+
+	loc = ep->tovpn_sid_locator;
+	plen = loc->block_bits_length + loc->node_bits_length + loc->function_bits_length;
+
+	/* End.M.GTP{4,6}.E reads the SID locator length from
+	 * SEG6_MOBILE_SR_PREFIX_LEN to position the IPv4 DA / Args.Mob.Session;
+	 * it must not be inferred from the route prefix, which is unavailable
+	 * when the kernel builds the lwtunnel from a nexthop object.
+	 */
+	mctx.sr_prefix_len = plen;
+
+	vrf = vrf_lookup_by_id(bgp->vrf_id);
+	mctx.vrftable = vrf ? vrf->data.l.table_id : 0;
+	if (!mctx.vrftable)
+		mctx.vrftable = ep->vrftable;
+
+	/* End.M.GTP{4,6}.E emits the GTP-U packet out the originating VRF's
+	 * N3-side interface.  FRR models a Linux VRF with vrf_id == the VRF
+	 * device ifindex, so the SID (installed in the default VRF) egresses
+	 * via that device.  Origination only runs on a non-default VRF.
+	 */
+	oif = (bgp->vrf_id != VRF_DEFAULT) ? bgp->vrf_id : 0;
+
+	dedup = !withdraw && ep->last_installed_act == act &&
+		IPV6_ADDR_SAME(&ep->last_installed_sid, ep->tovpn_sid);
+	if (withdraw || !dedup)
+		zclient_send_localsid_mobile(bgp_zclient,
+					     withdraw ? ZEBRA_ROUTE_DELETE : ZEBRA_ROUTE_ADD,
+					     ep->tovpn_sid, plen, oif, act, &mctx);
+
+	if (withdraw) {
+		memset(&ep->last_installed_sid, 0, sizeof(ep->last_installed_sid));
+		ep->last_installed_act = ZEBRA_SEG6_MOBILE_ACTION_UNSPEC;
+	} else {
+		ep->last_installed_sid = *ep->tovpn_sid;
+		ep->last_installed_act = act;
+	}
+}
+
+/* Pin @locator_bgp (deep copy), stash @sid as the policy's ISD SID,
+ * latch ready, and install the End.M.GTP*.E local SID.  Shared by the
+ * SID-manager notify path (SID_AUTO) and the explicit-SID path.
+ */
+static void bgp_mup_export_arm_sid(struct bgp *bgp, afi_t afi, struct bgp_mup_export_policy *ep,
+				   struct srv6_locator *locator_bgp, const struct in6_addr *sid)
+{
+	if (ep->tovpn_sid_locator)
+		srv6_locator_free(ep->tovpn_sid_locator);
+	ep->tovpn_sid_locator = srv6_locator_alloc(locator_bgp->name);
+	srv6_locator_copy(ep->tovpn_sid_locator, locator_bgp);
+
+	XFREE(MTYPE_BGP_SRV6_SID, ep->tovpn_sid);
+	ep->tovpn_sid = XCALLOC(MTYPE_BGP_SRV6_SID, sizeof(struct in6_addr));
+	*ep->tovpn_sid = *sid;
+	ep->tovpn_sid_ready = true;
+
+	bgp_mup_install_isd_localsid(bgp, afi, false);
+}
+
+/* Make the (vrf, afi) ISD policy's SID ready.  SID_EXPLICIT arms the
+ * operator-supplied value synchronously against the resolved locator;
+ * SID_AUTO asks the SRv6 SID manager and the notify hook arms it on
+ * arrival.  No-op when neither flag is set, when a SID is already
+ * ready, or when no locator is resolvable yet (locator-arrival replays).
+ */
+static void bgp_mup_request_isd_sid(struct bgp *bgp, afi_t afi)
+{
+	struct bgp_mup_export_policy *ep = bgp_mup_export_peek(bgp, afi);
+	struct srv6_sid_ctx ctx = {};
+	struct in6_addr sid = {};
+	const char *loc_name;
+	enum seg6_mobile_action_t act;
+
+	if (!ep)
+		return;
+	if (ep->tovpn_sid_ready)
+		return;
+
+	act = bgp_mup_isd_action_for_afi(afi);
+	if (act == ZEBRA_SEG6_MOBILE_ACTION_UNSPEC)
+		return;
+
+	loc_name = bgp_mup_select_locator_name(bgp, ep);
+	if (!loc_name)
+		return;
+
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_EXPLICIT)) {
+		struct srv6_locator *locator_bgp = bgp_srv6_locator_lookup(bgp, bgp_get_default());
+
+		if (!ep->tovpn_sid_explicit || !locator_bgp ||
+		    strcmp(locator_bgp->name, loc_name) != 0)
+			return;
+		bgp_mup_export_arm_sid(bgp, afi, ep, locator_bgp, ep->tovpn_sid_explicit);
+		return;
+	}
+
+	if (!CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_AUTO))
+		return;
+
+	ctx.mobile_behavior = act;
+	ctx.vrf_id = bgp->vrf_id;
+
+	(void)bgp_zebra_request_srv6_sid(&ctx, &sid, loc_name, NULL);
+}
+
+/* Hook the SRv6 SID notify path so the BGP-MUP originate side
+ * claims SIDs allocated against End.M.GTP*.E.  When a SID lands
+ * for the expected (vrf, afi) policy, pin the locator deeply, stash
+ * the SID value, install the local SID, and flag the policy as
+ * ready.  Returns true iff the notify was consumed.
+ */
+bool bgp_mup_handle_sid_alloc(struct bgp *bgp, const struct srv6_sid_ctx *ctx,
+			      const struct in6_addr *sid, const char *loc_name)
+{
+	struct bgp_mup_export_policy *ep;
+	struct srv6_locator *locator_bgp;
+	const char *want_name;
+	afi_t afi;
+
+	if (!bgp || !ctx || !sid || !loc_name)
+		return false;
+
+	if (ctx->mobile_behavior == ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP4_E)
+		afi = AFI_IP;
+	else if (ctx->mobile_behavior == ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_E)
+		afi = AFI_IP6;
+	else
+		return false;
+
+	ep = bgp_mup_export_peek(bgp, afi);
+	if (!ep || !CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_AUTO))
+		return false;
+
+	want_name = bgp_mup_select_locator_name(bgp, ep);
+	if (!want_name || strcmp(want_name, loc_name) != 0)
+		return false;
+
+	locator_bgp = bgp_srv6_locator_lookup(bgp, bgp_get_default());
+	if (!locator_bgp || strcmp(locator_bgp->name, loc_name) != 0)
+		return false;
+
+	bgp_mup_export_arm_sid(bgp, afi, ep, locator_bgp, sid);
+
+	/* ISD UPDATE emit is wired up in a following commit. */
+	return true;
+}
+
+/* Bgp-instance locator just became available (or the configured
+ * locator was rebound).  Walk per-(vrf, afi) MUP policies and kick
+ * a SID request for any that have SID_AUTO set but are not yet
+ * ready.  Per-instance replay of policies already configured before
+ * the locator arrived.
+ */
+void bgp_mup_locator_arrived(struct bgp *bgp)
+{
+	afi_t afi;
+
+	if (!bgp)
+		return;
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++)
+		bgp_mup_request_isd_sid(bgp, afi);
+}
+
+/* The configured locator was deleted: tear down any local-SID
+ * installs that referenced it, drop the cached SID, and clear the
+ * ready latch so ISD emit stops advertising stale SIDs.  Caller
+ * iterates over bgp instances; this helper handles one.
+ */
+void bgp_mup_locator_delete_purge(struct bgp *bgp, const struct srv6_locator *locator)
+{
+	struct bgp_mup_export_policy *ep;
+	afi_t afi;
+
+	if (!bgp || !locator)
+		return;
+	for (afi = AFI_IP; afi <= AFI_IP6; afi++) {
+		ep = bgp_mup_export_peek(bgp, afi);
+		if (!ep || !ep->tovpn_sid_locator)
+			continue;
+		if (strcmp(ep->tovpn_sid_locator->name, locator->name) != 0)
+			continue;
+
+		bgp_mup_install_isd_localsid(bgp, afi, true);
+
+		XFREE(MTYPE_BGP_SRV6_SID, ep->tovpn_sid);
+		srv6_locator_free(ep->tovpn_sid_locator);
+		ep->tovpn_sid_locator = NULL;
+		ep->tovpn_sid_ready = false;
+	}
 }
 
 /*

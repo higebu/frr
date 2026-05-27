@@ -3807,6 +3807,11 @@ static int bgp_zebra_process_srv6_locator_internal(struct srv6_locator *locator,
 	bgp_srv6_unicast_ensure_afi_sid(bgp, AFI_IP);
 	bgp_srv6_unicast_ensure_afi_sid(bgp, AFI_IP6);
 
+	/* Kick any per-(vrf, afi) BGP-MUP origination policies that were
+	 * configured before the locator arrived (SID_AUTO replay).
+	 */
+	bgp_mup_locator_arrived(bgp);
+
 	return 0;
 }
 
@@ -3892,6 +3897,13 @@ static int bgp_zebra_srv6_sid_notify(ZAPI_CALLBACK_ARGS)
 		if (BGP_DEBUG(zebra, ZEBRA))
 			zlog_debug("SRv6 SID %pI6 %s : ALLOCATED", &sid_addr,
 				   srv6_sid_ctx2str(buf, sizeof(buf), &ctx));
+
+		/* BGP-MUP gets first shot at SIDs allocated for the
+		 * seg6_mobile family; everything else continues with the
+		 * legacy seg6_local DT4/DT6/DT46 handling below.
+		 */
+		if (bgp_mup_handle_sid_alloc(bgp_vrf, &ctx, &sid_addr, loc_name))
+			return 0;
 
 		if (!strmatch(locator_bgp->name, loc_name) ||
 		    (bgp_vrf->srv6_locator_name[0] != '\0' &&
@@ -4354,6 +4366,11 @@ static void bgp_zebra_process_srv6_locator_delete_per_bgp(struct srv6_locator *l
 			vpn_leak_prechange(BGP_VPN_POLICY_DIR_TOVPN, AFI_IP6, bgp_get_default(),
 					   bgp_vrf);
 		}
+
+		/* Release any BGP-MUP local-SID installs that referenced
+		 * this locator before VPN cleanup continues.
+		 */
+		bgp_mup_locator_delete_purge(bgp_vrf, loc);
 	}
 
 	// refresh chunks
