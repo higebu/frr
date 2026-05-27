@@ -999,6 +999,12 @@ extern enum zclient_send_status zclient_send_localsid(struct zclient *zclient, u
 						      enum seg6local_action_t action,
 						      const struct seg6local_context *context);
 
+extern enum zclient_send_status zclient_send_localsid_mobile(struct zclient *zclient, uint8_t cmd,
+							     const struct in6_addr *sid,
+							     uint16_t prefixlen, ifindex_t oif,
+							     enum seg6_mobile_action_t action,
+							     const struct seg6_mobile_ctx *ctx);
+
 extern void zclient_send_reg_requests(struct zclient *zclient, vrf_id_t vrf_id);
 extern void zclient_send_dereg_requests(struct zclient *zclient, vrf_id_t vrf_id);
 extern enum zclient_send_status
