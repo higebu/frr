@@ -603,6 +603,66 @@ enum zclient_send_status zclient_send_localsid(struct zclient *zclient, uint8_t 
 	return zclient_route_send(ZEBRA_ROUTE_ADD, zclient, &api);
 }
 
+enum zclient_send_status zclient_send_localsid_mobile(struct zclient *zclient, uint8_t cmd,
+						      const struct in6_addr *sid,
+						      uint16_t prefixlen, ifindex_t oif,
+						      enum seg6_mobile_action_t action,
+						      const struct seg6_mobile_ctx *ctx)
+{
+	struct prefix_ipv6 p = {};
+	struct zapi_route api = {};
+	struct zapi_nexthop *znh;
+	struct interface *ifp;
+
+	if (prefixlen > IPV6_MAX_BITLEN) {
+		flog_warn(EC_LIB_DEVELOPMENT, "%s: wrong prefixlen %u", __func__, prefixlen);
+		return ZCLIENT_SEND_FAILURE;
+	}
+
+	if (zclient_debug)
+		zlog_debug("%s:  |- %s SRv6 Mobile SID %pI6 behavior %s", __func__,
+			   cmd != ZEBRA_ROUTE_ADD ? "Add" : "Delete", sid,
+			   seg6_mobile_action2str(action));
+
+	ifp = select_oif_for_localsid(oif);
+	if (!ifp) {
+		zlog_err("Unable to obtain a valid outgoing interface for installing the SID.");
+		zlog_err(
+			"Please ensure that a dummy interface named 'sr0' exists and is operational.");
+		return ZCLIENT_SEND_FAILURE;
+	}
+
+	p.family = AF_INET6;
+	p.prefixlen = prefixlen;
+	p.prefix = *sid;
+
+	api.vrf_id = VRF_DEFAULT;
+	api.type = zclient->redist_default;
+	api.instance = 0;
+	api.safi = SAFI_UNICAST;
+	memcpy(&api.prefix, &p, sizeof(p));
+
+	if (cmd == ZEBRA_ROUTE_DELETE)
+		return zclient_route_send(ZEBRA_ROUTE_DELETE, zclient, &api);
+
+	SET_FLAG(api.flags, ZEBRA_FLAG_ALLOW_RECURSION);
+	SET_FLAG(api.message, ZAPI_MESSAGE_NEXTHOP);
+
+	znh = &api.nexthops[0];
+
+	memset(znh, 0, sizeof(*znh));
+
+	znh->type = NEXTHOP_TYPE_IFINDEX;
+	znh->ifindex = ifp->ifindex;
+	SET_FLAG(znh->flags, ZAPI_NEXTHOP_FLAG_SEG6_MOBILE);
+	znh->seg6_mobile_action = action;
+	memcpy(&znh->seg6_mobile_ctx, ctx, sizeof(struct seg6_mobile_ctx));
+
+	api.nexthop_num = 1;
+
+	return zclient_route_send(ZEBRA_ROUTE_ADD, zclient, &api);
+}
+
 static void zclient_send_table_direct(struct zclient *zclient, afi_t afi, int type)
 {
 	struct redist_table_direct *table;
