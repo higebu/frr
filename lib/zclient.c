@@ -1019,8 +1019,19 @@ static int zapi_nexthop_srv6_cmp(const struct zapi_nexthop *next1,
 	if (next1->seg6local_action < next2->seg6local_action)
 		return -1;
 
-	return memcmp(&next1->seg6local_ctx, &next2->seg6local_ctx,
-		      sizeof(struct seg6local_context));
+	ret = memcmp(&next1->seg6local_ctx, &next2->seg6local_ctx,
+		     sizeof(struct seg6local_context));
+	if (ret != 0)
+		return ret;
+
+	if (next1->seg6_mobile_action > next2->seg6_mobile_action)
+		return 1;
+
+	if (next1->seg6_mobile_action < next2->seg6_mobile_action)
+		return -1;
+
+	return memcmp(&next1->seg6_mobile_ctx, &next2->seg6_mobile_ctx,
+		      sizeof(struct seg6_mobile_ctx));
 }
 
 static int zapi_nexthop_cmp_no_labels(const struct zapi_nexthop *next1,
@@ -1228,6 +1239,12 @@ int zapi_nexthop_encode(struct stream *s, const struct zapi_nexthop *api_nh,
 		stream_putl(s, api_nh->seg6local_action);
 		stream_write(s, &api_nh->seg6local_ctx,
 			     sizeof(struct seg6local_context));
+	}
+
+	if (CHECK_FLAG(nh_flags, ZAPI_NEXTHOP_FLAG_SEG6_MOBILE)) {
+		stream_putl(s, api_nh->seg6_mobile_action);
+		stream_write(s, &api_nh->seg6_mobile_ctx,
+			     sizeof(struct seg6_mobile_ctx));
 	}
 
 	if (CHECK_FLAG(nh_flags, ZAPI_NEXTHOP_FLAG_SEG6)) {
@@ -1663,6 +1680,12 @@ int zapi_nexthop_decode(struct stream *s, struct zapi_nexthop *api_nh,
 		STREAM_GETL(s, api_nh->seg6local_action);
 		STREAM_GET(&api_nh->seg6local_ctx, s,
 			   sizeof(struct seg6local_context));
+	}
+
+	if (CHECK_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_SEG6_MOBILE)) {
+		STREAM_GETL(s, api_nh->seg6_mobile_action);
+		STREAM_GET(&api_nh->seg6_mobile_ctx, s,
+			   sizeof(struct seg6_mobile_ctx));
 	}
 
 	if (CHECK_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_SEG6)) {
@@ -2457,6 +2480,10 @@ struct nexthop *nexthop_from_zapi_nexthop(const struct zapi_nexthop *znh)
 		nexthop_add_srv6_seg6local(n, znh->seg6local_action,
 					   &znh->seg6local_ctx);
 
+	if (znh->seg6_mobile_action != ZEBRA_SEG6_MOBILE_ACTION_UNSPEC)
+		nexthop_add_srv6_seg6_mobile(n, znh->seg6_mobile_action,
+					     &znh->seg6_mobile_ctx);
+
 	if (znh->seg_num && !sid_zero_ipv6(znh->seg6_segs))
 		nexthop_add_srv6_seg6(n, &znh->seg6_segs[0], znh->seg_num,
 				      znh->srv6_encap_behavior, &znh->srv6_encap_source);
@@ -2518,6 +2545,15 @@ int zapi_nexthop_from_nexthop(struct zapi_nexthop *znh,
 			memcpy(&znh->seg6local_ctx,
 			       &nh->nh_srv6->seg6local_ctx,
 			       sizeof(struct seg6local_context));
+		}
+
+		if (nh->nh_srv6->seg6_mobile_action !=
+		    ZEBRA_SEG6_MOBILE_ACTION_UNSPEC) {
+			SET_FLAG(znh->flags, ZAPI_NEXTHOP_FLAG_SEG6_MOBILE);
+			znh->seg6_mobile_action = nh->nh_srv6->seg6_mobile_action;
+			memcpy(&znh->seg6_mobile_ctx,
+			       &nh->nh_srv6->seg6_mobile_ctx,
+			       sizeof(struct seg6_mobile_ctx));
 		}
 
 		if (nh->nh_srv6->seg6_segs && nh->nh_srv6->seg6_segs->num_segs &&
