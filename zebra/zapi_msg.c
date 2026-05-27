@@ -1907,6 +1907,16 @@ static bool zapi_read_nexthops(struct zserv *client, struct prefix *p,
 						   &api_nh->seg6local_ctx);
 		}
 
+		if (CHECK_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_SEG6_MOBILE)
+		    && api_nh->type != NEXTHOP_TYPE_BLACKHOLE) {
+			if (IS_ZEBRA_DEBUG_RECV)
+				zlog_debug("%s: adding seg6_mobile action %d", __func__,
+					   api_nh->seg6_mobile_action);
+
+			nexthop_add_srv6_seg6_mobile(nexthop, api_nh->seg6_mobile_action,
+						     &api_nh->seg6_mobile_ctx);
+		}
+
 		if (CHECK_FLAG(api_nh->flags, ZAPI_NEXTHOP_FLAG_SEG6)
 		    && api_nh->type != NEXTHOP_TYPE_BLACKHOLE) {
 			if (IS_ZEBRA_DEBUG_RECV)
