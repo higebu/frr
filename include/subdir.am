@@ -21,5 +21,6 @@ noinst_HEADERS += \
 	include/linux/seg6_hmac.h \
 	include/linux/seg6_iptunnel.h \
 	include/linux/seg6_local.h \
+	include/linux/seg6_mobile.h \
 	include/linux/pkt_cls.h \
 	# end

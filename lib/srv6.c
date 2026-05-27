@@ -62,6 +62,28 @@ const char *seg6local_action2str(uint32_t action)
 	return seg6local_action2str_with_next_csid(action, false);
 }
 
+const char *seg6_mobile_action2str(uint32_t action)
+{
+	switch (action) {
+	case ZEBRA_SEG6_MOBILE_ACTION_END_MAP:
+		return "End.MAP";
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP4_E:
+		return "End.M.GTP4.E";
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_E:
+		return "End.M.GTP6.E";
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D:
+		return "End.M.GTP6.D";
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D_DI:
+		return "End.M.GTP6.D.Di";
+	case ZEBRA_SEG6_MOBILE_ACTION_H_M_GTP4_D:
+		return "H.M.GTP4.D";
+	case ZEBRA_SEG6_MOBILE_ACTION_UNSPEC:
+		return "unspec";
+	default:
+		return "unknown";
+	}
+}
+
 int snprintf_seg6_segs(char *str,
 		size_t size, const struct seg6_segs *segs)
 {
@@ -141,6 +163,56 @@ void seg6local_context2json(const struct seg6local_context *ctx,
 		json_object_boolean_add(json, "unknown", true);
 		return;
 	}
+}
+
+/* Render the attributes an SRv6 Mobile User Plane action carries.  They
+ * are optional per action, so only the ones that are set are emitted;
+ * the action name itself is printed by the caller.
+ */
+const char *seg6_mobile_context2str(char *str, size_t size, const struct seg6_mobile_ctx *ctx,
+				    uint32_t action)
+{
+	size_t len = 0;
+
+	str[0] = '\0';
+	if (action == ZEBRA_SEG6_MOBILE_ACTION_UNSPEC)
+		return str;
+
+	if (!IPV6_ADDR_SAME(&ctx->nh6, &in6addr_any) && len < size)
+		len += snprintfrr(str + len, size - len, "mapped_sid %pI6 ", &ctx->nh6);
+	if (!IPV6_ADDR_SAME(&ctx->src_addr, &in6addr_any) && len < size)
+		len += snprintfrr(str + len, size - len, "src %pI6 ", &ctx->src_addr);
+	if (ctx->sr_prefix_len && len < size)
+		len += snprintf(str + len, size - len, "sr_prefix_len %u ", ctx->sr_prefix_len);
+	if (ctx->v6_src_prefix_len && len < size)
+		len += snprintf(str + len, size - len, "v6_src_prefix_len %u ",
+				ctx->v6_src_prefix_len);
+	if (ctx->pdu_type && len < size)
+		len += snprintf(str + len, size - len, "pdu_type %u ", ctx->pdu_type);
+	if (ctx->vrftable && len < size)
+		snprintf(str + len, size - len, "vrftable %u", ctx->vrftable);
+
+	return str;
+}
+
+void seg6_mobile_context2json(const struct seg6_mobile_ctx *ctx, uint32_t action,
+			      struct json_object *json)
+{
+	if (action == ZEBRA_SEG6_MOBILE_ACTION_UNSPEC)
+		return;
+
+	if (!IPV6_ADDR_SAME(&ctx->nh6, &in6addr_any))
+		json_object_string_addf(json, "mappedSid", "%pI6", &ctx->nh6);
+	if (!IPV6_ADDR_SAME(&ctx->src_addr, &in6addr_any))
+		json_object_string_addf(json, "srcAddr", "%pI6", &ctx->src_addr);
+	if (ctx->sr_prefix_len)
+		json_object_int_add(json, "srPrefixLen", ctx->sr_prefix_len);
+	if (ctx->v6_src_prefix_len)
+		json_object_int_add(json, "v6SrcPrefixLen", ctx->v6_src_prefix_len);
+	if (ctx->pdu_type)
+		json_object_int_add(json, "pduType", ctx->pdu_type);
+	if (ctx->vrftable)
+		json_object_int_add(json, "vrfTable", ctx->vrftable);
 }
 
 static char *seg6local_flavors2str(char *str, size_t size,
