@@ -44,12 +44,6 @@ void bgp_mup_export_clear(struct bgp *bgp, afi_t afi);
  */
 void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi);
 
-/* Emit per-(vrf, afi) MUP-policy lines under
- * `address-family ipv[46] unicast`.  Sibling of L3VPN's
- * `rd vpn export` / `rt vpn <import|export|both>` writeback.
- */
-void bgp_mup_export_config_write(struct vty *vty, struct bgp *bgp, afi_t afi, int indent);
-
 /* Register BGP-MUP CLI commands under BGP_IPV4_MUP_NODE / BGP_IPV6_MUP_NODE. */
 void bgp_mup_vty_init(void);
 
