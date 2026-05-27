@@ -438,6 +438,14 @@ struct srv6_sid_ctx {
 	struct in6_addr nh6;
 	vrf_id_t vrf_id;
 	ifindex_t ifindex;
+
+	/* Behavior selector for SRv6 Mobile User Plane SIDs (RFC 9433),
+	 * which live in their own LWTUNNEL_ENCAP_SEG6_MOBILE family and
+	 * cannot be expressed in @behavior.  When set to a non-UNSPEC
+	 * value, @behavior is expected to stay UNSPEC and consumers
+	 * dispatch on @mobile_behavior instead.
+	 */
+	enum seg6_mobile_action_t mobile_behavior;
 };
 
 static inline const char *srv6_headend_behavior2str(enum srv6_headend_behavior behavior,
