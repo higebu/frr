@@ -467,7 +467,15 @@ struct zapi_nexthop {
 	uint32_t seg6local_action;
 	struct seg6local_context seg6local_ctx;
 
-	/* SRv6 Headend-behaviour */
+	/* SRv6 Mobile User Plane localsid info.  Mutually exclusive with
+	 * seg6local_action: at most one of the two is non-UNSPEC.
+	 */
+	uint32_t seg6_mobile_action;
+	struct seg6_mobile_ctx seg6_mobile_ctx;
+
+	/* SRv6 Headend-behaviour, also used as the SR Policy carrier for
+	 * End.M.GTP6.D / End.M.GTP6.D.Di.
+	 */
 	int seg_num;
 	struct in6_addr seg6_segs[SRV6_MAX_SEGS];
 	enum srv6_headend_behavior srv6_encap_behavior;
@@ -487,6 +495,7 @@ struct zapi_nexthop {
 #define ZAPI_NEXTHOP_FLAG_SEG6		0x10
 #define ZAPI_NEXTHOP_FLAG_SEG6LOCAL	0x20
 #define ZAPI_NEXTHOP_FLAG_EVPN		0x40
+#define ZAPI_NEXTHOP_FLAG_SEG6_MOBILE	0x80
 
 /*
  * ZAPI Nexthop Group. For use with protocol creation of nexthop groups.
