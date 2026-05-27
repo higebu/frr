@@ -19,6 +19,7 @@
 #include <linux/mpls_iptunnel.h>
 #include <linux/seg6_iptunnel.h>
 #include <linux/seg6_local.h>
+#include <linux/seg6_mobile.h>
 #include <linux/neighbour.h>
 #include <linux/rtnetlink.h>
 #include <linux/nexthop.h>
@@ -2049,6 +2050,140 @@ static bool _netlink_nexthop_encode_seg6local_info(const struct nexthop *nexthop
 	return true;
 }
 
+#ifndef LWTUNNEL_ENCAP_SEG6_MOBILE
+#define LWTUNNEL_ENCAP_SEG6_MOBILE 11
+#endif
+
+static ssize_t fill_srh_end_b6_encaps(char *buffer, size_t buflen,
+				      struct seg6_seg_stack *segs);
+
+/* Encode the LWTUNNEL_ENCAP_SEG6_MOBILE nest contents (SEG6_MOBILE_ACTION
+ * + per-action attribute leaves).  Caller has already emitted the RTA_ENCAP
+ * nest header and the matching RTA_ENCAP_TYPE.
+ */
+static bool _netlink_nexthop_encode_seg6_mobile_info(const struct nexthop *nexthop,
+						     struct nlmsghdr *nlmsg, size_t buflen)
+{
+	const struct seg6_mobile_ctx *ctx;
+
+	ctx = &nexthop->nh_srv6->seg6_mobile_ctx;
+
+	switch (nexthop->nh_srv6->seg6_mobile_action) {
+	case ZEBRA_SEG6_MOBILE_ACTION_END_MAP:
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_MOBILE_ACTION,
+				   SEG6_MOBILE_ACTION_END_MAP))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_MOBILE_NH6, &ctx->nh6,
+				 sizeof(struct in6_addr)))
+			return false;
+		break;
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP4_E:
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_MOBILE_ACTION,
+				   SEG6_MOBILE_ACTION_END_M_GTP4_E))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_MOBILE_SRC_ADDR,
+				 &ctx->src_addr, sizeof(struct in6_addr)))
+			return false;
+		if (ctx->v6_src_prefix_len &&
+		    !nl_attr_put8(nlmsg, buflen, SEG6_MOBILE_V6_SRC_PREFIX_LEN,
+				  ctx->v6_src_prefix_len))
+			return false;
+		if (!nl_attr_put8(nlmsg, buflen, SEG6_MOBILE_SR_PREFIX_LEN,
+				  ctx->sr_prefix_len))
+			return false;
+		break;
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_E:
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_MOBILE_ACTION,
+				   SEG6_MOBILE_ACTION_END_M_GTP6_E))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_MOBILE_SRC_ADDR,
+				 &ctx->src_addr, sizeof(struct in6_addr)))
+			return false;
+		if (!nl_attr_put8(nlmsg, buflen, SEG6_MOBILE_SR_PREFIX_LEN,
+				  ctx->sr_prefix_len))
+			return false;
+		break;
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D:
+	case ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D_DI: {
+		uint32_t kaction = (nexthop->nh_srv6->seg6_mobile_action ==
+				    ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_D)
+					   ? SEG6_MOBILE_ACTION_END_M_GTP6_D
+					   : SEG6_MOBILE_ACTION_END_M_GTP6_D_DI;
+		char srh_buf[4096];
+		ssize_t srh_len;
+
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_MOBILE_ACTION, kaction))
+			return false;
+		/* End.M.GTP{6.D, 6.D.Di} carry the SR Policy in the same SRH
+		 * shape End.B6.Encap uses; reuse the existing packer.
+		 */
+		if (!nexthop->nh_srv6->seg6_segs ||
+		    nexthop->nh_srv6->seg6_segs->num_segs == 0 ||
+		    sid_zero(nexthop->nh_srv6->seg6_segs)) {
+			zlog_err("%s: End.M.GTP6.D{,Di} install missing SRH segs",
+				 __func__);
+			return false;
+		}
+		srh_len = fill_srh_end_b6_encaps(srh_buf, sizeof(srh_buf),
+						 nexthop->nh_srv6->seg6_segs);
+		if (srh_len < 0)
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_MOBILE_SRH, srh_buf, srh_len))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_MOBILE_SRC_ADDR,
+				 &ctx->src_addr, sizeof(struct in6_addr)))
+			return false;
+		if (kaction == SEG6_MOBILE_ACTION_END_M_GTP6_D &&
+		    !nl_attr_put8(nlmsg, buflen, SEG6_MOBILE_SR_PREFIX_LEN,
+				  ctx->sr_prefix_len))
+			return false;
+		break;
+	}
+	case ZEBRA_SEG6_MOBILE_ACTION_H_M_GTP4_D: {
+		char srh_buf[4096];
+		ssize_t srh_len;
+
+		if (!nl_attr_put32(nlmsg, buflen, SEG6_MOBILE_ACTION,
+				   SEG6_MOBILE_ACTION_H_M_GTP4_D))
+			return false;
+		/* H.M.GTP4.D carries the SR Policy as an SRH (same shape
+		 * End.M.GTP6.D uses); the kernel reads segments[0] as the
+		 * outer DA base and overlays the 32-bit inner IPv4 DA right
+		 * after sr_prefix_len.
+		 */
+		if (!nexthop->nh_srv6->seg6_segs ||
+		    nexthop->nh_srv6->seg6_segs->num_segs == 0 ||
+		    sid_zero(nexthop->nh_srv6->seg6_segs)) {
+			zlog_err("%s: H.M.GTP4.D install missing SRH segs",
+				 __func__);
+			return false;
+		}
+		srh_len = fill_srh_end_b6_encaps(srh_buf, sizeof(srh_buf),
+						 nexthop->nh_srv6->seg6_segs);
+		if (srh_len < 0)
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_MOBILE_SRH, srh_buf, srh_len))
+			return false;
+		if (!nl_attr_put(nlmsg, buflen, SEG6_MOBILE_SRC_ADDR,
+				 &ctx->src_addr, sizeof(struct in6_addr)))
+			return false;
+		if (!nl_attr_put8(nlmsg, buflen, SEG6_MOBILE_SR_PREFIX_LEN,
+				  ctx->sr_prefix_len))
+			return false;
+		break;
+	}
+	case ZEBRA_SEG6_MOBILE_ACTION_UNSPEC:
+		zlog_err("%s: unspecified seg6_mobile action", __func__);
+		return false;
+	}
+
+	if (ctx->vrftable &&
+	    !nl_attr_put32(nlmsg, buflen, SEG6_MOBILE_VRFTABLE, ctx->vrftable))
+		return false;
+
+	return true;
+}
+
 /* This function takes a nexthop as argument and adds
  * the appropriate netlink attributes to an existing
  * netlink message.
@@ -2097,10 +2232,33 @@ static bool _netlink_route_build_singlepath(const struct prefix *p,
 				return false;
 
 			nl_attr_nest_end(nlmsg, nest);
+		} else if (nexthop->nh_srv6->seg6_mobile_action !=
+			   ZEBRA_SEG6_MOBILE_ACTION_UNSPEC) {
+			struct rtattr *nest;
+
+			if (!nl_attr_put16(nlmsg, req_size, RTA_ENCAP_TYPE,
+					   LWTUNNEL_ENCAP_SEG6_MOBILE))
+				return false;
+
+			nest = nl_attr_nest(nlmsg, req_size, RTA_ENCAP);
+			if (!nest)
+				return false;
+
+			if (!_netlink_nexthop_encode_seg6_mobile_info(nexthop, nlmsg, req_size))
+				return false;
+
+			nl_attr_nest_end(nlmsg, nest);
 		}
 
+		/* H.Encaps SEG6 nest is mutually exclusive with seg6_mobile:
+		 * the SR Policy SRH for End.M.GTP6.D{,Di} lives inside the
+		 * SEG6_MOBILE nest (SEG6_MOBILE_SRH), not in a separate
+		 * LWTUNNEL_ENCAP_SEG6 nest.
+		 */
 		if (nexthop->nh_srv6->seg6_segs && nexthop->nh_srv6->seg6_segs->num_segs &&
-		    !sid_zero(nexthop->nh_srv6->seg6_segs)) {
+		    !sid_zero(nexthop->nh_srv6->seg6_segs) &&
+		    nexthop->nh_srv6->seg6_mobile_action ==
+			    ZEBRA_SEG6_MOBILE_ACTION_UNSPEC) {
 			struct rtattr *nest;
 
 			if (!nl_attr_put16(nlmsg, req_size, RTA_ENCAP_TYPE,
@@ -3358,12 +3516,39 @@ ssize_t netlink_nexthop_msg_encode(uint16_t cmd,
 						return 0;
 
 					nl_attr_nest_end(&req->n, nest);
+				} else if (nh->nh_srv6->seg6_mobile_action !=
+					   ZEBRA_SEG6_MOBILE_ACTION_UNSPEC) {
+					/* nh_family stays at the value derived from
+					 * the route afi above.  H.M.GTP4.D installs
+					 * on AF_INET prefixes; the kernel registers
+					 * the action with input_family = AF_INET and
+					 * rejects RTM_NEWNEXTHOP if forced to AF_INET6.
+					 */
+					encap = LWTUNNEL_ENCAP_SEG6_MOBILE;
+					if (!nl_attr_put(&req->n, buflen,
+							 NHA_ENCAP_TYPE,
+							 &encap,
+							 sizeof(uint16_t)))
+						return 0;
+
+					nest = nl_attr_nest(&req->n, buflen,
+						NHA_ENCAP | NLA_F_NESTED);
+					if (!nest)
+						return 0;
+
+					if (!_netlink_nexthop_encode_seg6_mobile_info(nh, &req->n,
+										      buflen))
+						return 0;
+
+					nl_attr_nest_end(&req->n, nest);
 				}
 
 				if (nh->nh_srv6->seg6_segs && nh->nh_srv6->seg6_segs->num_segs &&
 				    !sid_zero(nh->nh_srv6->seg6_segs) &&
 				    nh->nh_srv6->seg6local_action ==
-					    ZEBRA_SEG6_LOCAL_ACTION_UNSPEC) {
+					    ZEBRA_SEG6_LOCAL_ACTION_UNSPEC &&
+				    nh->nh_srv6->seg6_mobile_action ==
+					    ZEBRA_SEG6_MOBILE_ACTION_UNSPEC) {
 					if (!nl_attr_put16(&req->n, buflen,
 					    NHA_ENCAP_TYPE,
 					    LWTUNNEL_ENCAP_SEG6))

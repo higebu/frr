@@ -722,6 +722,42 @@ void nexthop_del_srv6_seg6local(struct nexthop *nexthop)
 		XFREE(MTYPE_NH_SRV6, nexthop->nh_srv6);
 }
 
+void nexthop_add_srv6_seg6_mobile(struct nexthop *nexthop, uint32_t action,
+				  const struct seg6_mobile_ctx *ctx)
+{
+	if (action == ZEBRA_SEG6_MOBILE_ACTION_UNSPEC)
+		return;
+
+	if (!nexthop->nh_srv6)
+		nexthop->nh_srv6 = XCALLOC(MTYPE_NH_SRV6,
+					   sizeof(struct nexthop_srv6));
+
+	nexthop->nh_srv6->seg6_mobile_action = action;
+	nexthop->nh_srv6->seg6_mobile_ctx = *ctx;
+}
+
+void nexthop_del_srv6_seg6_mobile(struct nexthop *nexthop)
+{
+	if (!nexthop->nh_srv6)
+		return;
+
+	if (nexthop->nh_srv6->seg6_mobile_action == ZEBRA_SEG6_MOBILE_ACTION_UNSPEC)
+		return;
+
+	nexthop->nh_srv6->seg6_mobile_action = ZEBRA_SEG6_MOBILE_ACTION_UNSPEC;
+	memset(&nexthop->nh_srv6->seg6_mobile_ctx, 0,
+	       sizeof(struct seg6_mobile_ctx));
+
+	if (nexthop->nh_srv6->seg6_segs &&
+	    (nexthop->nh_srv6->seg6_segs->num_segs == 0 ||
+	     sid_zero(nexthop->nh_srv6->seg6_segs)))
+		XFREE(MTYPE_NH_SRV6, nexthop->nh_srv6->seg6_segs);
+
+	if (nexthop->nh_srv6->seg6_segs == NULL &&
+	    nexthop->nh_srv6->seg6local_action == ZEBRA_SEG6_LOCAL_ACTION_UNSPEC)
+		XFREE(MTYPE_NH_SRV6, nexthop->nh_srv6);
+}
+
 void nexthop_add_srv6_seg6(struct nexthop *nexthop, const struct in6_addr *segs, int num_segs,
 			   enum srv6_headend_behavior encap_behavior,
 			   const struct in6_addr *encap_source)
@@ -904,6 +940,24 @@ uint32_t nexthop_hash(const struct nexthop *nexthop)
 			if (nexthop->nh_srv6->seg6_segs)
 				key = jhash(&nexthop->nh_srv6->seg6_segs->seg[0],
 					    sizeof(struct in6_addr), key);
+		} else if (nexthop->nh_srv6->seg6_mobile_action !=
+			   ZEBRA_SEG6_MOBILE_ACTION_UNSPEC) {
+			key = jhash_1word(nexthop->nh_srv6->seg6_mobile_action,
+					  key);
+			key = jhash(&nexthop->nh_srv6->seg6_mobile_ctx,
+				    sizeof(nexthop->nh_srv6->seg6_mobile_ctx),
+				    key);
+			if (nexthop->nh_srv6->seg6_segs) {
+				segs_num = nexthop->nh_srv6->seg6_segs->num_segs;
+				while (segs_num >= 1) {
+					key = jhash(&nexthop->nh_srv6->seg6_segs
+							    ->seg[i],
+						    sizeof(struct in6_addr),
+						    key);
+					segs_num -= 1;
+					i += 1;
+				}
+			}
 		} else {
 			if (nexthop->nh_srv6->seg6_segs) {
 				segs_num = nexthop->nh_srv6->seg6_segs->num_segs;
@@ -957,6 +1011,11 @@ void nexthop_copy_no_recurse(struct nexthop *copy,
 			nexthop_add_srv6_seg6local(copy,
 				nexthop->nh_srv6->seg6local_action,
 				&nexthop->nh_srv6->seg6local_ctx);
+		if (nexthop->nh_srv6->seg6_mobile_action !=
+		    ZEBRA_SEG6_MOBILE_ACTION_UNSPEC)
+			nexthop_add_srv6_seg6_mobile(copy,
+				nexthop->nh_srv6->seg6_mobile_action,
+				&nexthop->nh_srv6->seg6_mobile_ctx);
 		if (nexthop->nh_srv6->seg6_segs &&
 		    nexthop->nh_srv6->seg6_segs->num_segs &&
 		    !sid_zero(nexthop->nh_srv6->seg6_segs))
