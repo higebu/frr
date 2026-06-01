@@ -25236,6 +25236,26 @@ void bgp_vty_init(void)
 	install_element(BGP_IPV6_NODE, &bgp_redistribute_ipv6_metric_rmap_cmd);
 	install_element(BGP_IPV6_NODE, &bgp_redistribute_ipv6_table_cmd);
 	install_element(BGP_IPV6_NODE, &no_bgp_redistribute_ipv6_table_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_cmd);
+	install_element(BGP_MUPV4_NODE, &no_bgp_redistribute_ipv4_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_rmap_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_metric_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_rmap_metric_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_metric_rmap_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_ospf_cmd);
+	install_element(BGP_MUPV4_NODE, &no_bgp_redistribute_ipv4_ospf_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_ospf_rmap_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_ospf_metric_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_ospf_rmap_metric_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_redistribute_ipv4_ospf_metric_rmap_cmd);
+	install_element(BGP_MUPV6_NODE, &bgp_redistribute_ipv6_cmd);
+	install_element(BGP_MUPV6_NODE, &no_bgp_redistribute_ipv6_cmd);
+	install_element(BGP_MUPV6_NODE, &bgp_redistribute_ipv6_rmap_cmd);
+	install_element(BGP_MUPV6_NODE, &bgp_redistribute_ipv6_metric_cmd);
+	install_element(BGP_MUPV6_NODE, &bgp_redistribute_ipv6_rmap_metric_cmd);
+	install_element(BGP_MUPV6_NODE, &bgp_redistribute_ipv6_metric_rmap_cmd);
+	install_element(BGP_MUPV6_NODE, &bgp_redistribute_ipv6_table_cmd);
+	install_element(BGP_MUPV6_NODE, &no_bgp_redistribute_ipv6_table_cmd);
 
 	/* redistribute show commands */
 	install_element(VIEW_NODE, &show_bgp_redistribute_cmd);
