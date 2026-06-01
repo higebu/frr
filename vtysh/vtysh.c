@@ -1554,6 +1554,20 @@ static struct cmd_node bgp_mupv6_node = {
 	.prompt = "%s(config-router-af)# ",
 };
 
+static struct cmd_node bgp_mupv4_segment_direct_node = {
+	.name = "bgp ipv4 mup segment direct",
+	.node = BGP_MUPV4_SEGMENT_DIRECT_NODE,
+	.parent_node = BGP_MUPV4_NODE,
+	.prompt = "%s(config-router-af-mup-segment-direct)# ",
+};
+
+static struct cmd_node bgp_mupv6_segment_direct_node = {
+	.name = "bgp ipv6 mup segment direct",
+	.node = BGP_MUPV6_SEGMENT_DIRECT_NODE,
+	.parent_node = BGP_MUPV6_NODE,
+	.prompt = "%s(config-router-af-mup-segment-direct)# ",
+};
+
 static struct cmd_node ospf_node = {
 	.name = "ospf",
 	.node = OSPF_NODE,
@@ -1913,6 +1927,18 @@ DEFUNSH(VTYSH_BGPD, address_family_mupv6, address_family_mupv6_cmd,
 	"Enter Address Family command mode\n" BGP_AF_STR BGP_AF_MODIFIER_STR)
 {
 	vty->node = BGP_MUPV6_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFUNSH(VTYSH_BGPD, bgp_mup_segment_direct, bgp_mup_segment_direct_cmd,
+	"segment direct",
+	"Segment routing origination mode for this MUP address-family\n"
+	"Enable Direct Segment Discovery (single-NLRI per vrf,afi) origination\n")
+{
+	if (vty->node == BGP_MUPV6_NODE)
+		vty->node = BGP_MUPV6_SEGMENT_DIRECT_NODE;
+	else
+		vty->node = BGP_MUPV4_SEGMENT_DIRECT_NODE;
 	return CMD_SUCCESS;
 }
 
@@ -5381,6 +5407,8 @@ void vtysh_init_vty(void)
 	install_node(&bgp_ls_node);
 	install_node(&bgp_mupv4_node);
 	install_node(&bgp_mupv6_node);
+	install_node(&bgp_mupv4_segment_direct_node);
+	install_node(&bgp_mupv6_segment_direct_node);
 	install_node(&rip_node);
 	install_node(&ripng_node);
 	install_node(&ospf_node);
@@ -5593,6 +5621,15 @@ void vtysh_init_vty(void)
 	install_element(BGP_MUPV6_NODE, &vtysh_exit_bgpd_cmd);
 	install_element(BGP_MUPV6_NODE, &vtysh_end_all_cmd);
 	install_element(BGP_MUPV6_NODE, &exit_address_family_cmd);
+
+	install_element(BGP_MUPV4_NODE, &bgp_mup_segment_direct_cmd);
+	install_element(BGP_MUPV6_NODE, &bgp_mup_segment_direct_cmd);
+	install_element(BGP_MUPV4_SEGMENT_DIRECT_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_MUPV4_SEGMENT_DIRECT_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_MUPV4_SEGMENT_DIRECT_NODE, &vtysh_end_all_cmd);
+	install_element(BGP_MUPV6_SEGMENT_DIRECT_NODE, &vtysh_quit_bgpd_cmd);
+	install_element(BGP_MUPV6_SEGMENT_DIRECT_NODE, &vtysh_exit_bgpd_cmd);
+	install_element(BGP_MUPV6_SEGMENT_DIRECT_NODE, &vtysh_end_all_cmd);
 #endif /* HAVE_BGPD */
 
 	/* ripd */
