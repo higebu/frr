@@ -70,6 +70,13 @@ extern void bgp_mup_caches_free(struct bgp *bgp);
 /* Free the per-(vrf, afi) MUP export policy (called from bgp_free). */
 extern void bgp_mup_export_clear(struct bgp *bgp, afi_t afi);
 
+/* Per-prefix ISD origination hooks for the generic redistribute /
+ * static-route machinery (bgp_route.c).  Called when a locally-
+ * originated route enters or leaves a (vrf, afi, SAFI_MUP) RIB.
+ */
+void bgp_mup_vrf_update(struct bgp *from_bgp, struct bgp_path_info *pi);
+void bgp_mup_vrf_withdraw(struct bgp *from_bgp, struct bgp_path_info *pi);
+
 /* SRv6 SID notify hook for the BGP-MUP origination path.  Returns
  * true when the notification matches a per-(vrf, afi) MUP policy
  * and has been consumed (the seg6_mobile-family local SID is now
