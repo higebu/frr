@@ -6,6 +6,8 @@
 #include <zebra.h>
 #include <linux/rtnetlink.h> /* RT_TABLE_MAIN */
 
+#include "hash.h"
+#include "jhash.h"
 #include "prefix.h"
 #include "stream.h"
 #include "table.h"
@@ -31,6 +33,10 @@ DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_DSD, "BGP MUP DSD entry");
 DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_LIST, "BGP MUP list head");
 DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_IFACE_CACHE, "BGP MUP iface cache entry");
 DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_EXPORT, "BGP MUP per-vrf-per-afi export policy");
+DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_PENDING, "BGP MUP pending SID-alloc request");
+DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_ORIGIN, "BGP MUP persisted origin record");
+DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_STR, "BGP MUP origin verbatim string");
+DEFINE_MTYPE_STATIC(BGPD, BGP_MUP_SELF_KEY, "BGP MUP self-DSD index key");
 
 /* Direction-indexed RT slots on the per-(vrf, afi) MUP export policy.
  * Mirrors bgp_mplsvpn.c's BGP_VPN_POLICY_DIR_FROMVPN / DIR_TOVPN.
@@ -177,6 +183,17 @@ void bgp_mup_export_clear(struct bgp *bgp, afi_t afi)
  */
 static void mup_leak_from_vrf_update_all(struct bgp *to_bgp, struct bgp *from_bgp, afi_t afi);
 static void mup_leak_from_vrf_withdraw_all(struct bgp *to_bgp, struct bgp *from_bgp, afi_t afi);
+
+/* DSD origination hooks defined with the late DSD core block (which
+ * depends on bgp_mup_local_attr / bgp_mup_originate_common appearing
+ * earlier).  Forward-declared here so the front-of-file SID-alloc and
+ * teardown paths can dispatch into them without moving the core up.
+ */
+static bool bgp_mup_dispatch_pending_sid(struct bgp *bgp, const struct srv6_sid_ctx *ctx,
+					 const struct in6_addr *sid_value);
+static void bgp_mup_origins_pending_free(struct bgp *bgp);
+static void bgp_mup_replay_origins(struct bgp *bgp);
+static void bgp_mup_origins_locator_purge(struct bgp *bgp, const struct srv6_locator *locator);
 
 /* Map per-(vrf, afi) ISD origination to its SRv6 Mobile action: the
  * AFI of the leaked prefix selects End.M.GTP4.E (IPv4) or
@@ -349,6 +366,14 @@ bool bgp_mup_handle_sid_alloc(struct bgp *bgp, const struct srv6_sid_ctx *ctx,
 	if (!bgp || !ctx || !sid || !loc_name)
 		return false;
 
+	/* DSD originates with ctx.behavior set to a seg6local End.DT*
+	 * action and ctx.mobile_behavior unset, so a parked `segment
+	 * direct` request must be matched before the End.M.GTP*.E
+	 * (mobile_behavior) gate below would reject it.
+	 */
+	if (bgp_mup_dispatch_pending_sid(bgp, ctx, sid))
+		return true;
+
 	if (ctx->mobile_behavior == ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP4_E)
 		afi = AFI_IP;
 	else if (ctx->mobile_behavior == ZEBRA_SEG6_MOBILE_ACTION_END_M_GTP6_E)
@@ -391,6 +416,7 @@ void bgp_mup_locator_arrived(struct bgp *bgp)
 		return;
 	for (afi = AFI_IP; afi <= AFI_IP6; afi++)
 		bgp_mup_request_isd_sid(bgp, afi);
+	bgp_mup_replay_origins(bgp);
 }
 
 /* The configured locator was deleted: tear down any local-SID
@@ -423,6 +449,11 @@ void bgp_mup_locator_delete_purge(struct bgp *bgp, const struct srv6_locator *lo
 		ep->tovpn_sid_locator = NULL;
 		ep->tovpn_sid_ready = false;
 	}
+
+	/* DSD origins pin no per-policy locator copy; match them by the
+	 * installed SID falling inside the deleted locator's prefix.
+	 */
+	bgp_mup_origins_locator_purge(bgp, locator);
 }
 
 /*
@@ -997,6 +1028,155 @@ static struct bgp_mup_dsd_segid_hash_head *bgp_mup_get_dsd_segid_hash(struct bgp
 	return bgp->mup_dsd_segid_hash;
 }
 
+/* Parse an "ASN:NN" Direct-Type Segment Identifier operator string into
+ * its 16-bit AS and 32-bit value halves.  Returns false on malformed
+ * input (missing colon, overflow, trailing garbage).
+ */
+static bool bgp_mup_parse_seg_id_str(const char *mup_str, uint16_t *mup_as, uint32_t *mup_val)
+{
+	const char *colon;
+	char *endp;
+	unsigned long long lhs, rhs;
+
+	if (!mup_str)
+		return false;
+	colon = strchr(mup_str, ':');
+	if (!colon || colon == mup_str || !colon[1])
+		return false;
+	lhs = strtoull(mup_str, &endp, 10);
+	if (endp != colon)
+		return false;
+	rhs = strtoull(colon + 1, &endp, 10);
+	if (*endp != '\0')
+		return false;
+	if (lhs > UINT16_MAX || rhs > UINT32_MAX)
+		return false;
+	*mup_as = (uint16_t)lhs;
+	*mup_val = (uint32_t)rhs;
+	return true;
+}
+
+/* Build a MUP Extended Community of subtype Direct-Type Segment
+ * Identifier (draft-ietf-bess-mup-safi) from an "ASN:NN" operator
+ * string.  Returns the ecommunity (caller frees) or NULL on parse
+ * failure.
+ */
+static struct ecommunity *bgp_mup_build_mup_ec(const char *mup_str)
+{
+	uint16_t mup_as = 0;
+	uint32_t mup_val = 0;
+	struct ecommunity_val ev = {};
+	struct ecommunity *ec;
+
+	if (!bgp_mup_parse_seg_id_str(mup_str, &mup_as, &mup_val))
+		return NULL;
+	ev.val[0] = ECOMMUNITY_ENCODE_MUP;
+	ev.val[1] = ECOMMUNITY_MUP_SUBTYPE_DIRECT_SEG_ID;
+	ev.val[2] = (mup_as >> 8) & 0xff;
+	ev.val[3] = mup_as & 0xff;
+	ev.val[4] = (mup_val >> 24) & 0xff;
+	ev.val[5] = (mup_val >> 16) & 0xff;
+	ev.val[6] = (mup_val >> 8) & 0xff;
+	ev.val[7] = mup_val & 0xff;
+	ec = ecommunity_new();
+	ecommunity_add_val(ec, &ev, false, false);
+	return ec;
+}
+
+/* Map a DSD endpoint behavior (SRV6_ENDPOINT_BEHAVIOR_END_DT4/6/46, the
+ * wire/attr encoding kept in the export policy and origin records) to
+ * the seg6local action zebra installs for the local SID.  The reverse
+ * mapping is implicit: the DSD attr carries the SRV6_ENDPOINT_BEHAVIOR
+ * value verbatim.
+ */
+static enum seg6local_action_t bgp_mup_dsd_zebra_action(uint16_t behavior)
+{
+	switch (behavior) {
+	case SRV6_ENDPOINT_BEHAVIOR_END_DT4:
+		return ZEBRA_SEG6_LOCAL_ACTION_END_DT4;
+	case SRV6_ENDPOINT_BEHAVIOR_END_DT6:
+		return ZEBRA_SEG6_LOCAL_ACTION_END_DT6;
+	case SRV6_ENDPOINT_BEHAVIOR_END_DT46:
+		return ZEBRA_SEG6_LOCAL_ACTION_END_DT46;
+	default:
+		return ZEBRA_SEG6_LOCAL_ACTION_UNSPEC;
+	}
+}
+
+/* Process-global self-origin index for DSD.  Keyed by the 48-bit MUP-EC
+ * Direct-Type Segment Identifier of every persisted `segment direct`
+ * line across all bgp instances, so the receive-side self-DSD check
+ * (bgp_mup_dsd_is_self) answers in O(1) instead of walking every
+ * instance's origin list per T2ST UPDATE.  Lazily created on first
+ * insert, mirroring the file-static iface-state caches below; leaked at
+ * process exit like those.
+ */
+struct bgp_mup_self_dsd_key {
+	uint64_t segment_id;
+};
+
+static struct hash *bgp_mup_self_dsd_hash;
+
+static unsigned int bgp_mup_self_dsd_hash_key(const void *data)
+{
+	const struct bgp_mup_self_dsd_key *k = data;
+
+	return jhash_2words((uint32_t)(k->segment_id >> 32), (uint32_t)k->segment_id, 0xd5d5dead);
+}
+
+static bool bgp_mup_self_dsd_hash_cmp(const void *d1, const void *d2)
+{
+	const struct bgp_mup_self_dsd_key *a = d1;
+	const struct bgp_mup_self_dsd_key *b = d2;
+
+	return a->segment_id == b->segment_id;
+}
+
+static void *bgp_mup_self_dsd_alloc(void *data)
+{
+	struct bgp_mup_self_dsd_key *e = XCALLOC(MTYPE_BGP_MUP_SELF_KEY, sizeof(*e));
+
+	memcpy(e, data, sizeof(*e));
+	return e;
+}
+
+static void bgp_mup_self_dsd_index_add(uint64_t segment_id)
+{
+	struct bgp_mup_self_dsd_key tmp = { .segment_id = segment_id };
+
+	if (!bgp_mup_self_dsd_hash)
+		bgp_mup_self_dsd_hash = hash_create(bgp_mup_self_dsd_hash_key,
+						    bgp_mup_self_dsd_hash_cmp,
+						    "BGP MUP self DSD hash");
+	(void)hash_get(bgp_mup_self_dsd_hash, &tmp, bgp_mup_self_dsd_alloc);
+}
+
+static void bgp_mup_self_dsd_index_del(uint64_t segment_id)
+{
+	struct bgp_mup_self_dsd_key tmp = { .segment_id = segment_id };
+	struct bgp_mup_self_dsd_key *e;
+
+	if (!bgp_mup_self_dsd_hash)
+		return;
+	e = hash_release(bgp_mup_self_dsd_hash, &tmp);
+	XFREE(MTYPE_BGP_MUP_SELF_KEY, e);
+}
+
+/* True iff a `segment direct` line on any bgp instance owns the MUP-EC
+ * Direct-Type Segment Identifier carried on a T2ST.  Used to skip
+ * install for self-originated DSDs, whose resolved nexthop is a local
+ * End.DT* action that would black-hole if a copy of the T2ST came back
+ * over the BGP session.
+ */
+static bool bgp_mup_dsd_is_self(uint64_t segment_id)
+{
+	struct bgp_mup_self_dsd_key tmp = { .segment_id = segment_id };
+
+	if (!bgp_mup_self_dsd_hash)
+		return false;
+	return hash_lookup(bgp_mup_self_dsd_hash, &tmp) != NULL;
+}
+
 /* Extract the MUP-EC Direct-Type Segment Identifier (sub-type 0x00).
  * Returns true and writes a 48-bit value packed into the low bits of
  * @out (high uint16 << 32 | low uint32) when found.
@@ -1314,6 +1494,8 @@ void bgp_mup_caches_free(struct bgp *bgp)
 
 	for (afi = AFI_IP; afi < AFI_MAX; afi++)
 		event_cancel(&bgp->mup_reannounce_ev[afi]);
+
+	bgp_mup_origins_pending_free(bgp);
 
 	if (bgp->mup_isd_hash) {
 		while ((isd = bgp_mup_isd_hash_pop(bgp->mup_isd_hash))) {
@@ -2007,6 +2189,14 @@ static int bgp_mup_st_announce(struct bgp_dest *dest, struct bgp_path_info *info
 				zlog_debug("BGP-MUP: T2ST without MUP-EC; treat-as-withdraw");
 			return 0;
 		}
+		if (bgp_mup_dsd_is_self(segment_id)) {
+			if (BGP_DEBUG(zebra, ZEBRA))
+				zlog_debug("BGP-MUP: T2ST seg-id %" PRIu64
+					   " matches self-originated DSD; skip install (no loop)",
+					   segment_id);
+			bgp_mup_st_delete_send(bgp, info, mp);
+			return 0;
+		}
 		dsd = bgp_mup_dsd_lookup(bgp, segment_id);
 		if (!dsd) {
 			if (BGP_DEBUG(zebra, ZEBRA))
@@ -2381,8 +2571,17 @@ static struct bgp_mup_export_policy *bgp_mup_origin_active(struct bgp *bgp_vrf, 
 struct bgp_mup_origin_args {
 	afi_t afi;
 	struct prefix_rd prd;
-	struct prefix isd_prefix;
+	struct prefix isd_prefix; /* ISD only */
 	struct ecommunity *ecom;
+	/* DSD only (BGP_MUP_DSD_ROUTE).  dsd_endpoint is the originating
+	 * PE address carried in the DSD NLRI; dsd_behavior is the
+	 * SRV6_ENDPOINT_BEHAVIOR_END_DT* attr encoding; explicit_sid is
+	 * set from `sid explicit` and bypasses the async SID manager.
+	 */
+	struct ipaddr dsd_endpoint;
+	uint16_t dsd_behavior;
+	bool has_explicit_sid;
+	struct in6_addr explicit_sid;
 };
 
 /* Build one ISD NLRI for @args and submit it to the default-vrf MUP
@@ -2636,6 +2835,723 @@ static void mup_leak_postchange(afi_t afi, struct bgp *bgp)
 	mup_leak_from_vrf_update_all(to_bgp, bgp, afi);
 }
 
+/* ------------------------------------------------------------------ *
+ * DSD scalar origination (`segment direct`).
+ *
+ * Unlike ISD (which leaks per-prefix from the per-vrf unicast RIB),
+ * DSD originates a single NLRI per (vrf, afi) describing the local
+ * End.DT* decapsulation endpoint.  When the SID is auto-allocated the
+ * operator's args are parked on bgp->mup_pending until zebra answers;
+ * the configured line is mirrored into bgp->mup_origins so it survives
+ * SID-alloc cycles and replays on locator (re)arrival.
+ * ------------------------------------------------------------------ */
+
+/* When the operator types `segment direct ...` without `sid explicit`,
+ * we ask zebra's SRv6 SID manager for a function and complete the
+ * originate when the SID arrives via ZAPI_SRV6_SID_ALLOCATED.  Match
+ * SID-alloc replies by ctx (FIFO within a behavior class) — zebra
+ * processes get-sid requests serially per locator.
+ */
+struct bgp_mup_pending {
+	struct bgp_mup_pending_list_item item;
+	struct bgp_mup_origin_args args; /* args.ecom is dup'd & owned */
+	struct srv6_sid_ctx ctx;	 /* the ctx we sent to zebra */
+};
+DECLARE_LIST(bgp_mup_pending_list, struct bgp_mup_pending, item);
+
+static struct bgp_mup_pending_list_head *bgp_mup_get_pending_list(struct bgp *bgp)
+{
+	if (!bgp->mup_pending) {
+		bgp->mup_pending = XCALLOC(MTYPE_BGP_MUP_LIST, sizeof(*bgp->mup_pending));
+		bgp_mup_pending_list_init(bgp->mup_pending);
+	}
+	return bgp->mup_pending;
+}
+
+static struct bgp_mup_pending *bgp_mup_pending_pop(struct bgp *bgp, const struct srv6_sid_ctx *ctx)
+{
+	struct bgp_mup_pending *p;
+
+	if (!bgp->mup_pending)
+		return NULL;
+	frr_each_safe (bgp_mup_pending_list, bgp->mup_pending, p) {
+		if (p->ctx.behavior == ctx->behavior && p->ctx.vrf_id == ctx->vrf_id) {
+			bgp_mup_pending_list_del(bgp->mup_pending, p);
+			return p;
+		}
+	}
+	return NULL;
+}
+
+/* Pop a pending entry matching the operator's withdraw NLRI key, used
+ * to cancel a not-yet-allocated SID request when `no segment direct`
+ * arrives before zebra answered.  NULL means the SID alloc already
+ * completed and the route is in the RIB (regular withdraw applies).
+ */
+static struct bgp_mup_pending *bgp_mup_pending_pop_for_withdraw(struct bgp *bgp,
+								const struct bgp_mup_origin_args *args)
+{
+	struct bgp_mup_pending *p;
+
+	if (!bgp->mup_pending)
+		return NULL;
+	frr_each_safe (bgp_mup_pending_list, bgp->mup_pending, p) {
+		if (p->args.afi != args->afi)
+			continue;
+		if (memcmp(p->args.prd.val, args->prd.val, sizeof(p->args.prd.val)) != 0)
+			continue;
+		if (!ipaddr_is_same(&p->args.dsd_endpoint, &args->dsd_endpoint))
+			continue;
+		bgp_mup_pending_list_del(bgp->mup_pending, p);
+		return p;
+	}
+	return NULL;
+}
+
+static void bgp_mup_pending_free(struct bgp_mup_pending *p)
+{
+	if (p->args.ecom)
+		ecommunity_free(&p->args.ecom);
+	XFREE(MTYPE_BGP_MUP_PENDING, p);
+}
+
+/* Persistent record of an operator-configured `segment direct` line.
+ * Survives SID-alloc cycles so the running config can re-emit the
+ * originate after a locator (re)arrival.  rt_str / mup_str preserve the
+ * operator's exact text for verbatim `show running-config` roundtrip.
+ */
+struct bgp_mup_origin {
+	struct bgp_mup_origin_list_item item;
+	afi_t afi;
+	struct prefix_rd prd;
+	struct ipaddr dsd_endpoint;
+	uint16_t dsd_behavior;
+	bool has_explicit_sid;
+	struct in6_addr explicit_sid;
+	char *rt_str;
+	struct ecommunity *rt_ecom;
+	char *mup_str;
+	uint64_t segment_id; /* pre-parsed mup_as<<32 | mup_val */
+	bool has_segment_id;
+	/* In-memory marker: SID assigned and local install issued.  Reset
+	 * on bgpd restart so the locator-arrival replay re-runs `segment
+	 * direct` lines that landed before chunks were ready.  The (sid,
+	 * act) fingerprint suppresses redundant netlink installs on replay.
+	 */
+	bool sid_ready;
+	struct in6_addr last_installed_sid;
+	enum seg6local_action_t last_installed_act;
+};
+DECLARE_LIST(bgp_mup_origin_list, struct bgp_mup_origin, item);
+
+static struct bgp_mup_origin_list_head *bgp_mup_get_origin_list(struct bgp *bgp)
+{
+	if (!bgp->mup_origins) {
+		bgp->mup_origins = XCALLOC(MTYPE_BGP_MUP_LIST, sizeof(*bgp->mup_origins));
+		bgp_mup_origin_list_init(bgp->mup_origins);
+	}
+	return bgp->mup_origins;
+}
+
+static bool bgp_mup_origin_match(const struct bgp_mup_origin *o, afi_t afi,
+				 const struct prefix_rd *prd, const struct ipaddr *dsd_endpoint)
+{
+	if (o->afi != afi)
+		return false;
+	if (memcmp(o->prd.val, prd->val, sizeof(o->prd.val)) != 0)
+		return false;
+	return ipaddr_is_same(&o->dsd_endpoint, dsd_endpoint);
+}
+
+static struct bgp_mup_origin *bgp_mup_origin_find(struct bgp *bgp, afi_t afi,
+						  const struct prefix_rd *prd,
+						  const struct ipaddr *dsd_endpoint)
+{
+	struct bgp_mup_origin *o;
+
+	if (!bgp->mup_origins)
+		return NULL;
+	frr_each (bgp_mup_origin_list, bgp->mup_origins, o) {
+		if (bgp_mup_origin_match(o, afi, prd, dsd_endpoint))
+			return o;
+	}
+	return NULL;
+}
+
+static void bgp_mup_origin_free(struct bgp_mup_origin *o)
+{
+	XFREE(MTYPE_BGP_MUP_STR, o->rt_str);
+	if (o->rt_ecom)
+		ecommunity_free(&o->rt_ecom);
+	XFREE(MTYPE_BGP_MUP_STR, o->mup_str);
+	XFREE(MTYPE_BGP_MUP_ORIGIN, o);
+}
+
+static bool bgp_mup_origin_segment_id(const struct bgp_mup_origin *o, uint64_t *out)
+{
+	if (!o->has_segment_id)
+		return false;
+	*out = o->segment_id;
+	return true;
+}
+
+/* Record the (sid, action) just pushed to zebra so a later emit can
+ * skip the redundant zclient_send_localsid().  No-op if the origin is
+ * not (yet) persisted — the synchronous explicit-SID path emits before
+ * persist, which is fine: the very first install is never deduped.
+ */
+static void bgp_mup_origin_mark_installed(struct bgp *bgp, afi_t afi, const struct prefix_rd *prd,
+					  const struct ipaddr *dsd_endpoint,
+					  const struct in6_addr *sid, enum seg6local_action_t act)
+{
+	struct bgp_mup_origin *o = bgp_mup_origin_find(bgp, afi, prd, dsd_endpoint);
+
+	if (!o)
+		return;
+	o->sid_ready = true;
+	o->last_installed_sid = *sid;
+	o->last_installed_act = act;
+}
+
+static bool bgp_mup_origin_localsid_cached(struct bgp *bgp, afi_t afi, const struct prefix_rd *prd,
+					   const struct ipaddr *dsd_endpoint,
+					   const struct in6_addr *sid, enum seg6local_action_t act)
+{
+	struct bgp_mup_origin *o = bgp_mup_origin_find(bgp, afi, prd, dsd_endpoint);
+
+	if (!o || !o->sid_ready)
+		return false;
+	if (o->last_installed_act != act)
+		return false;
+	return IPV6_ADDR_SAME(&o->last_installed_sid, sid);
+}
+
+static void bgp_mup_origin_clear_installed(struct bgp *bgp, afi_t afi, const struct prefix_rd *prd,
+					   const struct ipaddr *dsd_endpoint)
+{
+	struct bgp_mup_origin *o = bgp_mup_origin_find(bgp, afi, prd, dsd_endpoint);
+
+	if (!o)
+		return;
+	o->sid_ready = false;
+	memset(&o->last_installed_sid, 0, sizeof(o->last_installed_sid));
+	o->last_installed_act = ZEBRA_SEG6_LOCAL_ACTION_UNSPEC;
+}
+
+/* Insert a new persistent record, replacing any existing entry with the
+ * same NLRI key.  Carries over the install fingerprint so a synchronous
+ * explicit-SID emit (run before persist) survives the replacement.
+ */
+static void bgp_mup_origin_persist(struct bgp *bgp, const struct bgp_mup_origin_args *args,
+				   const char *rt_str, const char *mup_str)
+{
+	struct bgp_mup_origin *o;
+	struct ecommunity *rt_ecom;
+	uint64_t segment_id;
+	bool sid_ready = false;
+	struct in6_addr last_sid = {};
+	enum seg6local_action_t last_act = ZEBRA_SEG6_LOCAL_ACTION_UNSPEC;
+
+	rt_ecom = ecommunity_str2com(rt_str, ECOMMUNITY_ROUTE_TARGET, 0);
+	if (!rt_ecom)
+		return;
+
+	o = bgp_mup_origin_find(bgp, args->afi, &args->prd, &args->dsd_endpoint);
+	if (o) {
+		if (bgp_mup_origin_segment_id(o, &segment_id))
+			bgp_mup_self_dsd_index_del(segment_id);
+		sid_ready = o->sid_ready;
+		last_sid = o->last_installed_sid;
+		last_act = o->last_installed_act;
+		bgp_mup_origin_list_del(bgp->mup_origins, o);
+		bgp_mup_origin_free(o);
+	}
+	o = XCALLOC(MTYPE_BGP_MUP_ORIGIN, sizeof(*o));
+	o->afi = args->afi;
+	o->prd = args->prd;
+	o->dsd_endpoint = args->dsd_endpoint;
+	o->dsd_behavior = args->dsd_behavior;
+	o->has_explicit_sid = args->has_explicit_sid;
+	o->explicit_sid = args->explicit_sid;
+	o->rt_str = XSTRDUP(MTYPE_BGP_MUP_STR, rt_str);
+	o->rt_ecom = rt_ecom;
+	o->sid_ready = sid_ready;
+	o->last_installed_sid = last_sid;
+	o->last_installed_act = last_act;
+	o->mup_str = XSTRDUP(MTYPE_BGP_MUP_STR, mup_str);
+	{
+		uint16_t mup_as = 0;
+		uint32_t mup_val = 0;
+
+		if (bgp_mup_parse_seg_id_str(mup_str, &mup_as, &mup_val)) {
+			o->segment_id = ((uint64_t)mup_as << 32) | mup_val;
+			o->has_segment_id = true;
+		}
+	}
+	bgp_mup_origin_list_add_tail(bgp_mup_get_origin_list(bgp), o);
+	if (bgp_mup_origin_segment_id(o, &segment_id))
+		bgp_mup_self_dsd_index_add(segment_id);
+}
+
+static void bgp_mup_origin_forget(struct bgp *bgp, afi_t afi, const struct prefix_rd *prd,
+				  const struct ipaddr *dsd_endpoint)
+{
+	struct bgp_mup_origin *o = bgp_mup_origin_find(bgp, afi, prd, dsd_endpoint);
+	uint64_t segment_id;
+
+	if (!o)
+		return;
+	if (bgp_mup_origin_segment_id(o, &segment_id))
+		bgp_mup_self_dsd_index_del(segment_id);
+	bgp_mup_origin_list_del(bgp->mup_origins, o);
+	bgp_mup_origin_free(o);
+}
+
+/* Drain and free the per-bgp DSD pending + origin lists on instance
+ * teardown.  Called from bgp_mup_caches_free().
+ */
+static void bgp_mup_origins_pending_free(struct bgp *bgp)
+{
+	struct bgp_mup_pending *p;
+	struct bgp_mup_origin *o;
+
+	if (bgp->mup_pending) {
+		while ((p = bgp_mup_pending_list_pop(bgp->mup_pending)))
+			bgp_mup_pending_free(p);
+		bgp_mup_pending_list_fini(bgp->mup_pending);
+		XFREE(MTYPE_BGP_MUP_LIST, bgp->mup_pending);
+	}
+	if (bgp->mup_origins) {
+		while ((o = bgp_mup_origin_list_pop(bgp->mup_origins))) {
+			uint64_t segment_id;
+
+			if (bgp_mup_origin_segment_id(o, &segment_id))
+				bgp_mup_self_dsd_index_del(segment_id);
+			bgp_mup_origin_free(o);
+		}
+		bgp_mup_origin_list_fini(bgp->mup_origins);
+		XFREE(MTYPE_BGP_MUP_LIST, bgp->mup_origins);
+	}
+}
+
+static void bgp_mup_emit_dsd_cache_update(struct bgp *bgp, const struct bgp_mup_origin_args *args,
+					  const struct in6_addr *sid, struct srv6_locator *loc,
+					  struct attr *attr, bool withdraw)
+{
+	struct bgp *cache_bgp = (bgp->vrf_id == VRF_DEFAULT) ? bgp : bgp_get_default();
+
+	if (!cache_bgp)
+		cache_bgp = bgp;
+	if (!withdraw) {
+		bool has_seg = false;
+		uint64_t seg_id = 0;
+
+		if (attr)
+			has_seg = bgp_mup_get_direct_seg_id(attr, &seg_id);
+		bgp_mup_dsd_cache_upsert(cache_bgp, args->afi, &args->prd, &args->dsd_endpoint, sid,
+					 loc->block_bits_length, loc->node_bits_length,
+					 loc->function_bits_length, loc->argument_bits_length,
+					 args->dsd_behavior, has_seg, seg_id);
+	} else {
+		bgp_mup_dsd_cache_remove(cache_bgp, args->afi, &args->prd, &args->dsd_endpoint);
+	}
+}
+
+/* Synchronous DSD originate: build the prefix_mup + attr from a known
+ * SID, submit to the default-vrf MUP RIB, and install the local End.DT*
+ * seg6local action.  Mirrors bgp_mplsvpn.c::vpn_leak_zebra_vrf_sid_
+ * update_per_af() — DSD is a per-VRF VPN segment, so the SID terminates
+ * by decapsulating SRv6 and looking up the inner packet in bgp's vrf
+ * table.
+ */
+static int bgp_mup_emit_dsd(struct bgp *bgp, const struct bgp_mup_origin_args *args,
+			    const struct in6_addr *sid, bool withdraw)
+{
+	struct prefix_mup p = {};
+	struct attr *attr = NULL;
+	struct srv6_locator *loc;
+	uint8_t addr_octets;
+	int ret;
+
+	loc = bgp_srv6_locator_lookup(bgp, bgp_get_default());
+	if (!loc)
+		return -1;
+
+	addr_octets = (args->afi == AFI_IP) ? IPV4_MAX_BYTELEN : IPV6_MAX_BYTELEN;
+	bgp_mup_prefix_init(&p, BGP_MUP_DSD_ROUTE, 8 + addr_octets);
+	memcpy(p.prefix.rd, args->prd.val, 8);
+	p.prefix.dsd_route.ip = args->dsd_endpoint;
+
+	if (!withdraw) {
+		struct bgp_mup_export_policy *ep = bgp_mup_export_peek(bgp, args->afi);
+		struct in6_addr nh_storage = {};
+		const struct in6_addr *nh = NULL;
+
+		if (ep && CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_NEXTHOP_SET)) {
+			if (ep->tovpn_nexthop.family == AF_INET6) {
+				nh_storage = ep->tovpn_nexthop.u.prefix6;
+				nh = &nh_storage;
+			} else if (ep->tovpn_nexthop.family == AF_INET) {
+				nh_storage.s6_addr[10] = 0xff;
+				nh_storage.s6_addr[11] = 0xff;
+				memcpy(&nh_storage.s6_addr[12], &ep->tovpn_nexthop.u.prefix4, 4);
+				nh = &nh_storage;
+			}
+		}
+		attr = bgp_mup_local_attr(bgp, sid, args->dsd_behavior, loc->block_bits_length,
+					  loc->node_bits_length, loc->function_bits_length,
+					  loc->argument_bits_length, args->ecom, nh);
+	}
+	ret = bgp_mup_originate_common(bgp, args->afi, &p, attr, withdraw);
+	bgp_mup_emit_dsd_cache_update(bgp, args, sid, loc, attr, withdraw);
+
+	{
+		struct seg6local_context lctx = {};
+		enum seg6local_action_t act;
+		struct vrf *vrf = vrf_lookup_by_id(bgp->vrf_id);
+
+		lctx.block_len = loc->block_bits_length;
+		lctx.node_len = loc->node_bits_length;
+		lctx.function_len = loc->function_bits_length;
+		lctx.argument_len = loc->argument_bits_length;
+		lctx.table = vrf ? vrf->data.l.table_id : RT_TABLE_MAIN;
+		act = bgp_mup_dsd_zebra_action(args->dsd_behavior);
+		if (act != ZEBRA_SEG6_LOCAL_ACTION_UNSPEC) {
+			/* Install at /loc_func, NOT /128: H.M.GTP4.D at the
+			 * peer MUP-GW rewrites the SRv6 destination to encode
+			 * the v4 source + Args.Mob.Session, so the decap-side
+			 * End.DT* action must match the locator+function
+			 * prefix range.  oif = per-vrf loopback so the post-
+			 * action IP lookup happens in bgp's vrf table — the
+			 * same hint L3VPN's tovpn_sid install passes.
+			 */
+			uint16_t plen = loc->block_bits_length + loc->node_bits_length +
+					loc->function_bits_length;
+			struct interface *vrf_lo = if_get_vrf_loopback(bgp->vrf_id);
+			ifindex_t oif = vrf_lo ? vrf_lo->ifindex : 0;
+
+			if (withdraw ||
+			    !bgp_mup_origin_localsid_cached(bgp, args->afi, &args->prd,
+							    &args->dsd_endpoint, sid, act))
+				zclient_send_localsid(bgp_zclient,
+						      withdraw ? ZEBRA_ROUTE_DELETE : ZEBRA_ROUTE_ADD,
+						      sid, plen, oif, act, &lctx);
+			if (!withdraw && ret == 0)
+				bgp_mup_origin_mark_installed(bgp, args->afi, &args->prd,
+							      &args->dsd_endpoint, sid, act);
+			else if (withdraw)
+				bgp_mup_origin_clear_installed(bgp, args->afi, &args->prd,
+							       &args->dsd_endpoint);
+		}
+	}
+
+	if (attr)
+		bgp_attr_unintern(&attr);
+	return ret;
+}
+
+/* Originate (or withdraw) the DSD for @args. */
+static int bgp_mup_originate_dsd(struct bgp *bgp, const struct bgp_mup_origin_args *args,
+				bool withdraw)
+{
+	struct bgp_mup_pending *p;
+	struct srv6_sid_ctx ctx = {};
+
+	if (args->afi != AFI_IP && args->afi != AFI_IP6)
+		return -1;
+	switch (args->dsd_behavior) {
+	case SRV6_ENDPOINT_BEHAVIOR_END_DT4:
+	case SRV6_ENDPOINT_BEHAVIOR_END_DT6:
+	case SRV6_ENDPOINT_BEHAVIOR_END_DT46:
+		break;
+	default:
+		zlog_err("BGP-MUP: DSD behavior %u not supported", args->dsd_behavior);
+		return -1;
+	}
+
+	/* Defer silently when no locator is configured yet or chunks
+	 * haven't arrived; the persisted origin replays via
+	 * bgp_mup_replay_origins() from the locator-arrival hook.
+	 */
+	if (!bgp_srv6_locator_is_configured(bgp))
+		return 0;
+	if (!bgp_srv6_locator_lookup(bgp, bgp_get_default()))
+		return 0;
+
+	if (args->has_explicit_sid)
+		return bgp_mup_emit_dsd(bgp, args, &args->explicit_sid, withdraw);
+
+	if (withdraw) {
+		struct bgp_mup_pending *cancel;
+
+		ctx.behavior = bgp_mup_dsd_zebra_action(args->dsd_behavior);
+		ctx.vrf_id = bgp->vrf_id;
+
+		cancel = bgp_mup_pending_pop_for_withdraw(bgp, args);
+		bgp_zebra_release_srv6_sid(&ctx, bgp->srv6_locator_name);
+		if (cancel) {
+			bgp_mup_pending_free(cancel);
+			return 0;
+		}
+		return bgp_mup_emit_dsd(bgp, args, &in6addr_any, true);
+	}
+
+	p = XCALLOC(MTYPE_BGP_MUP_PENDING, sizeof(*p));
+	p->args = *args;
+	if (args->ecom)
+		p->args.ecom = ecommunity_dup(args->ecom);
+	p->ctx.behavior = bgp_mup_dsd_zebra_action(args->dsd_behavior);
+	p->ctx.vrf_id = bgp->vrf_id;
+	bgp_mup_pending_list_add_tail(bgp_mup_get_pending_list(bgp), p);
+
+	{
+		struct in6_addr sid = {};
+
+		bgp_zebra_request_srv6_sid(&p->ctx, &sid, bgp->srv6_locator_name, NULL);
+	}
+	return 0;
+}
+
+/* SID-manager async completion hook for DSD (called from the front-of-
+ * file bgp_mup_handle_sid_alloc).  Returns true when a parked `segment
+ * direct` request matched @ctx and was dispatched into emit_dsd().
+ */
+static bool bgp_mup_dispatch_pending_sid(struct bgp *bgp, const struct srv6_sid_ctx *ctx,
+					 const struct in6_addr *sid_value)
+{
+	struct bgp_mup_pending *p = bgp_mup_pending_pop(bgp, ctx);
+
+	if (!p)
+		return false;
+	(void)bgp_mup_emit_dsd(bgp, &p->args, sid_value, false);
+	bgp_mup_pending_free(p);
+	return true;
+}
+
+/* Build the originate args from the per-(vrf, afi) export policy's
+ * `segment direct` sub-block.  The DSD address defaults to the
+ * speaker's IPv4 router-id; RD / RT / SID come from the shared
+ * `rd` / `rt export` / `sid` knobs on the enclosing MUP-AF policy.
+ */
+static bool mup_dsd_policy_ready(const struct bgp_mup_export_policy *ep)
+{
+	if (!ep)
+		return false;
+	if (!CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_DIRECT))
+		return false;
+	if (!CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_RD_SET))
+		return false;
+	if (!ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP])
+		return false;
+	if (!ep->dsd_mup_str || !ep->dsd_behavior)
+		return false;
+	return true;
+}
+
+static void mup_dsd_args_from_policy(struct bgp *bgp, afi_t afi,
+				     const struct bgp_mup_export_policy *ep,
+				     struct bgp_mup_origin_args *args, struct ecommunity **out_rt,
+				     struct ecommunity **out_mup_ec, struct ecommunity **out_ecom)
+{
+	struct ecommunity *rt = ecommunity_dup(ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP]);
+	struct ecommunity *mup_ec = bgp_mup_build_mup_ec(ep->dsd_mup_str);
+
+	args->afi = afi;
+	args->prd = ep->tovpn_rd;
+	args->dsd_behavior = ep->dsd_behavior;
+
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET)) {
+		args->dsd_endpoint = ep->dsd_address;
+	} else {
+		/* Default to the IPv4 router-id; the DSD NLRI Address AFI is
+		 * independent from the inner-PDU AFI per
+		 * draft-ietf-bess-mup-safi.
+		 */
+		args->dsd_endpoint.ipa_type = IPADDR_V4;
+		args->dsd_endpoint.ipaddr_v4 = bgp->router_id;
+	}
+
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_EXPLICIT) && ep->tovpn_sid_explicit) {
+		args->has_explicit_sid = true;
+		args->explicit_sid = *ep->tovpn_sid_explicit;
+	}
+
+	*out_rt = rt;
+	*out_mup_ec = mup_ec;
+	if (rt && mup_ec)
+		*out_ecom = ecommunity_merge(ecommunity_dup(rt), mup_ec);
+	else
+		*out_ecom = NULL;
+	args->ecom = *out_ecom;
+}
+
+static void mup_dsd_emit_singleton(struct bgp *bgp, afi_t afi, bool withdraw)
+{
+	struct bgp_mup_export_policy *ep = bgp_mup_export_peek(bgp, afi);
+	struct bgp_mup_origin_args args = {};
+	struct ecommunity *rt = NULL, *mup_ec = NULL, *ecom = NULL;
+
+	if (!mup_dsd_policy_ready(ep))
+		return;
+	if (!withdraw && bgp->router_id.s_addr == 0 &&
+	    !CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET)) {
+		zlog_warn("BGP-MUP: vrf %s has no router-id and no `segment direct` address override; deferring DSD origination",
+			  bgp->name ? bgp->name : "default");
+		return;
+	}
+
+	mup_dsd_args_from_policy(bgp, afi, ep, &args, &rt, &mup_ec, &ecom);
+	if (!ecom)
+		goto done;
+
+	(void)bgp_mup_originate_dsd(bgp, &args, withdraw);
+	if (!withdraw) {
+		char *rt_str = ecommunity_ecom2str(rt, ECOMMUNITY_FORMAT_ROUTE_MAP,
+						   ECOMMUNITY_ROUTE_TARGET);
+
+		bgp_mup_origin_persist(bgp, &args, rt_str, ep->dsd_mup_str);
+		XFREE(MTYPE_ECOMMUNITY_STR, rt_str);
+	} else {
+		bgp_mup_origin_forget(bgp, args.afi, &args.prd, &args.dsd_endpoint);
+	}
+
+done:
+	if (rt)
+		ecommunity_free(&rt);
+	if (mup_ec)
+		ecommunity_free(&mup_ec);
+	if (ecom)
+		ecommunity_free(&ecom);
+}
+
+static void mup_dsd_prechange(afi_t afi, struct bgp *bgp)
+{
+	mup_dsd_emit_singleton(bgp, afi, true);
+}
+
+static void mup_dsd_postchange(afi_t afi, struct bgp *bgp)
+{
+	mup_dsd_emit_singleton(bgp, afi, false);
+}
+
+/* Re-emit one persisted `segment direct` origin from its saved
+ * rt_ecom / mup_str so the persistent record stays the single source of
+ * truth.  Called after a locator (re)arrival for origins not yet bound
+ * to a SID.
+ */
+static void bgp_mup_replay_origin(struct bgp *bgp, struct bgp_mup_origin *o)
+{
+	struct bgp_mup_origin_args args = {};
+	struct ecommunity *rt, *mup_ec, *ecom;
+
+	if (!o->rt_ecom)
+		return;
+	mup_ec = bgp_mup_build_mup_ec(o->mup_str);
+	if (!mup_ec)
+		return;
+	rt = ecommunity_dup(o->rt_ecom);
+	ecom = ecommunity_merge(ecommunity_dup(rt), mup_ec);
+
+	args.afi = o->afi;
+	args.prd = o->prd;
+	args.dsd_endpoint = o->dsd_endpoint;
+	args.dsd_behavior = o->dsd_behavior;
+	args.has_explicit_sid = o->has_explicit_sid;
+	args.explicit_sid = o->explicit_sid;
+	args.ecom = ecom;
+
+	(void)bgp_mup_originate_dsd(bgp, &args, false);
+
+	ecommunity_free(&rt);
+	ecommunity_free(&mup_ec);
+	ecommunity_free(&ecom);
+}
+
+/* Locator-arrival hook helper: replay every persisted DSD origin on
+ * @bgp that has no SID bound yet.  Wired into bgp_mup_locator_arrived().
+ */
+static void bgp_mup_replay_origins(struct bgp *bgp)
+{
+	struct bgp_mup_origin *o;
+
+	if (!bgp->mup_origins)
+		return;
+	frr_each (bgp_mup_origin_list, bgp->mup_origins, o) {
+		if (o->sid_ready)
+			continue;
+		bgp_mup_replay_origin(bgp, o);
+	}
+}
+
+/* Locator-delete hook helper: withdraw and uninstall every persisted
+ * DSD origin on @bgp whose installed SID falls inside the deleted
+ * locator's prefix.  Wired into bgp_mup_locator_delete_purge().
+ */
+static void bgp_mup_origins_locator_purge(struct bgp *bgp, const struct srv6_locator *locator)
+{
+	struct bgp_mup_origin *o;
+
+	if (!bgp->mup_origins)
+		return;
+	frr_each (bgp_mup_origin_list, bgp->mup_origins, o) {
+		struct prefix sid_p = { .family = AF_INET6, .prefixlen = IPV6_MAX_BITLEN };
+		struct prefix_mup p = {};
+		uint8_t addr_octets;
+		uint16_t plen;
+		struct interface *vrf_lo;
+		ifindex_t oif;
+		enum seg6local_action_t act;
+
+		if (!o->sid_ready)
+			continue;
+		sid_p.u.prefix6 = o->last_installed_sid;
+		if (!prefix_match((const struct prefix *)&locator->prefix, &sid_p))
+			continue;
+
+		/* Withdraw the originated DSD NLRI so peers see the withdraw
+		 * before the SID disappears.
+		 */
+		addr_octets = (o->afi == AFI_IP) ? IPV4_MAX_BYTELEN : IPV6_MAX_BYTELEN;
+		bgp_mup_prefix_init(&p, BGP_MUP_DSD_ROUTE, 8 + addr_octets);
+		memcpy(p.prefix.rd, o->prd.val, 8);
+		p.prefix.dsd_route.ip = o->dsd_endpoint;
+		(void)bgp_mup_originate_common(bgp, o->afi, &p, NULL, true);
+
+		/* Tear down the End.DT* localsid whose locator is gone. */
+		act = o->last_installed_act;
+		if (act != ZEBRA_SEG6_LOCAL_ACTION_UNSPEC) {
+			struct seg6local_context lctx = {};
+			struct vrf *vrf = vrf_lookup_by_id(bgp->vrf_id);
+
+			vrf_lo = if_get_vrf_loopback(bgp->vrf_id);
+			oif = vrf_lo ? vrf_lo->ifindex : 0;
+			plen = locator->block_bits_length + locator->node_bits_length +
+			       locator->function_bits_length;
+			lctx.block_len = locator->block_bits_length;
+			lctx.node_len = locator->node_bits_length;
+			lctx.function_len = locator->function_bits_length;
+			lctx.argument_len = locator->argument_bits_length;
+			lctx.table = vrf ? vrf->data.l.table_id : RT_TABLE_MAIN;
+			zclient_send_localsid(bgp_zclient, ZEBRA_ROUTE_DELETE, &o->last_installed_sid,
+					      plen, oif, act, &lctx);
+		}
+
+		/* Auto-allocated DSDs: release the SID so a recreate with a
+		 * different prefix doesn't leak.  Explicit SIDs are not
+		 * manager-allocated; the arrival replay re-installs them.
+		 */
+		if (!o->has_explicit_sid) {
+			struct srv6_sid_ctx ctx = {};
+
+			ctx.behavior = bgp_mup_dsd_zebra_action(o->dsd_behavior);
+			ctx.vrf_id = bgp->vrf_id;
+			bgp_zebra_release_srv6_sid(&ctx, bgp->srv6_locator_name);
+		}
+
+		bgp_mup_origin_clear_installed(bgp, o->afi, &o->prd, &o->dsd_endpoint);
+	}
+}
+
 int bgp_nlri_parse_mup(struct peer *peer, struct attr *attr, struct bgp_nlri *packet, int withdraw)
 {
 	uint8_t *pnt;
@@ -2750,9 +3666,9 @@ int bgp_nlri_parse_mup(struct peer *peer, struct attr *attr, struct bgp_nlri *pa
 
 static afi_t bgp_mup_export_node2afi(struct vty *vty)
 {
-	if (vty->node == BGP_IPV4_MUP_NODE)
+	if (vty->node == BGP_IPV4_MUP_NODE || vty->node == BGP_IPV4_MUP_SEGMENT_DIRECT_NODE)
 		return AFI_IP;
-	if (vty->node == BGP_IPV6_MUP_NODE)
+	if (vty->node == BGP_IPV6_MUP_NODE || vty->node == BGP_IPV6_MUP_SEGMENT_DIRECT_NODE)
 		return AFI_IP6;
 	return AFI_MAX;
 }
@@ -3193,12 +4109,203 @@ DEFPY (af_mup_segment_interwork,
 	}
 
 	mup_leak_prechange(afi, bgp);
+	mup_dsd_prechange(afi, bgp);
 	ep = bgp_mup_export_get(bgp, afi);
-	if (yes)
+	if (yes) {
 		SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK);
-	else
+		/* ISD and DSD are mutually exclusive per (vrf, afi): turning
+		 * on interwork clears any `segment direct` sub-block so the
+		 * policy emits at most one of ISD or DSD.
+		 */
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_DIRECT |
+					      BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET);
+		memset(&ep->dsd_address, 0, sizeof(ep->dsd_address));
+	} else {
 		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK);
+	}
+	mup_dsd_postchange(afi, bgp);
 	mup_leak_postchange(afi, bgp);
+	return CMD_SUCCESS;
+}
+
+/* `segment direct` enters the DSD sub-block (BGP_IPV[46]_MUP_SEGMENT_
+ * DIRECT_NODE) where the address / behavior / segment-id knobs live.
+ * Mutually exclusive with `segment interwork`.
+ */
+DEFPY_NOSH (af_mup_segment_direct,
+	    af_mup_segment_direct_cmd,
+	    "segment direct",
+	    "Segment routing origination mode for this MUP address-family\n"
+	    "Enable Direct Segment Discovery (single-NLRI per vrf,afi) origination\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	mup_leak_prechange(afi, bgp);
+	mup_dsd_prechange(afi, bgp);
+	ep = bgp_mup_export_get(bgp, afi);
+	SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_DIRECT);
+	UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK);
+	mup_dsd_postchange(afi, bgp);
+	mup_leak_postchange(afi, bgp);
+
+	vty->node = (afi == AFI_IP) ? BGP_IPV4_MUP_SEGMENT_DIRECT_NODE
+				    : BGP_IPV6_MUP_SEGMENT_DIRECT_NODE;
+	return CMD_SUCCESS;
+}
+
+DEFPY (af_no_mup_segment_direct,
+       af_no_mup_segment_direct_cmd,
+       "no segment direct",
+       NO_STR
+       "Segment routing origination mode for this MUP address-family\n"
+       "Direct Segment Discovery sub-block\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	mup_dsd_prechange(afi, bgp);
+	ep = bgp_mup_export_get(bgp, afi);
+	UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_DIRECT |
+				      BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET);
+	memset(&ep->dsd_address, 0, sizeof(ep->dsd_address));
+	ep->dsd_behavior = 0;
+	XFREE(MTYPE_BGP_NAME, ep->dsd_mup_str);
+	ep->dsd_mup_as = 0;
+	ep->dsd_mup_val = 0;
+	mup_dsd_postchange(afi, bgp);
+	return CMD_SUCCESS;
+}
+
+/* Sub-node knobs under BGP_IPV[46]_MUP_SEGMENT_DIRECT_NODE. */
+
+DEFPY (af_mup_segment_direct_address,
+       af_mup_segment_direct_address_cmd,
+       "[no] address A.B.C.D$address",
+       NO_STR
+       "DSD originating-speaker address (default = bgp router-id)\n"
+       "IPv4 address overriding the bgp router-id\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int idx = 0;
+	bool yes = !argv_find(argv, argc, "no", &idx);
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	mup_dsd_prechange(afi, bgp);
+	ep = bgp_mup_export_get(bgp, afi);
+	if (yes) {
+		ep->dsd_address.ipa_type = IPADDR_V4;
+		ep->dsd_address.ipaddr_v4 = address;
+		SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET);
+	} else {
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET);
+		memset(&ep->dsd_address, 0, sizeof(ep->dsd_address));
+	}
+	mup_dsd_postchange(afi, bgp);
+	return CMD_SUCCESS;
+}
+
+DEFPY (af_mup_segment_direct_behavior,
+       af_mup_segment_direct_behavior_cmd,
+       "[no] behavior <dt4$dt4|dt6$dt6|dt46$dt46>",
+       NO_STR
+       "SRv6 endpoint behavior for the DSD prefix-SID\n"
+       "End.DT4 — decap and lookup in the IPv4 table\n"
+       "End.DT6 — decap and lookup in the IPv6 table\n"
+       "End.DT46 — decap and lookup in either the IPv4 or IPv6 table\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int idx = 0;
+	bool yes = !argv_find(argv, argc, "no", &idx);
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	mup_dsd_prechange(afi, bgp);
+	ep = bgp_mup_export_get(bgp, afi);
+	if (yes) {
+		if (dt4)
+			ep->dsd_behavior = SRV6_ENDPOINT_BEHAVIOR_END_DT4;
+		else if (dt6)
+			ep->dsd_behavior = SRV6_ENDPOINT_BEHAVIOR_END_DT6;
+		else if (dt46)
+			ep->dsd_behavior = SRV6_ENDPOINT_BEHAVIOR_END_DT46;
+	} else {
+		ep->dsd_behavior = 0;
+	}
+	mup_dsd_postchange(afi, bgp);
+	return CMD_SUCCESS;
+}
+
+ALIAS (af_mup_segment_direct_behavior,
+       af_no_mup_segment_direct_behavior_cmd,
+       "no behavior",
+       NO_STR
+       "SRv6 endpoint behavior for the DSD prefix-SID\n")
+
+DEFPY (af_mup_segment_direct_segment_id,
+       af_mup_segment_direct_segment_id_cmd,
+       "[no] segment-id ASN:NN$ec_str",
+       NO_STR
+       "BGP MUP Extended Community, Direct-Type Segment Identifier sub-type\n"
+       "MUP segment identifier (ASN:NN)\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int idx = 0;
+	bool yes = !argv_find(argv, argc, "no", &idx);
+	int ret;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	if (yes) {
+		uint16_t mup_as = 0;
+		uint32_t mup_val = 0;
+
+		if (!bgp_mup_parse_seg_id_str(ec_str, &mup_as, &mup_val)) {
+			vty_out(vty, "%% Malformed MUP segment identifier \"%s\"\n", ec_str);
+			return CMD_WARNING_CONFIG_FAILED;
+		}
+		mup_dsd_prechange(afi, bgp);
+		ep = bgp_mup_export_get(bgp, afi);
+		XFREE(MTYPE_BGP_NAME, ep->dsd_mup_str);
+		ep->dsd_mup_str = XSTRDUP(MTYPE_BGP_NAME, ec_str);
+		ep->dsd_mup_as = mup_as;
+		ep->dsd_mup_val = mup_val;
+		mup_dsd_postchange(afi, bgp);
+	} else {
+		mup_dsd_prechange(afi, bgp);
+		ep = bgp_mup_export_get(bgp, afi);
+		XFREE(MTYPE_BGP_NAME, ep->dsd_mup_str);
+		ep->dsd_mup_as = 0;
+		ep->dsd_mup_val = 0;
+		mup_dsd_postchange(afi, bgp);
+	}
 	return CMD_SUCCESS;
 }
 
@@ -3231,6 +4338,20 @@ void bgp_mup_vty_init(void)
 
 	install_element(BGP_IPV4_MUP_NODE, &af_mup_segment_interwork_cmd);
 	install_element(BGP_IPV6_MUP_NODE, &af_mup_segment_interwork_cmd);
+
+	install_element(BGP_IPV4_MUP_NODE, &af_mup_segment_direct_cmd);
+	install_element(BGP_IPV4_MUP_NODE, &af_no_mup_segment_direct_cmd);
+	install_element(BGP_IPV6_MUP_NODE, &af_mup_segment_direct_cmd);
+	install_element(BGP_IPV6_MUP_NODE, &af_no_mup_segment_direct_cmd);
+
+	install_element(BGP_IPV4_MUP_SEGMENT_DIRECT_NODE, &af_mup_segment_direct_address_cmd);
+	install_element(BGP_IPV4_MUP_SEGMENT_DIRECT_NODE, &af_mup_segment_direct_behavior_cmd);
+	install_element(BGP_IPV4_MUP_SEGMENT_DIRECT_NODE, &af_no_mup_segment_direct_behavior_cmd);
+	install_element(BGP_IPV4_MUP_SEGMENT_DIRECT_NODE, &af_mup_segment_direct_segment_id_cmd);
+	install_element(BGP_IPV6_MUP_SEGMENT_DIRECT_NODE, &af_mup_segment_direct_address_cmd);
+	install_element(BGP_IPV6_MUP_SEGMENT_DIRECT_NODE, &af_mup_segment_direct_behavior_cmd);
+	install_element(BGP_IPV6_MUP_SEGMENT_DIRECT_NODE, &af_no_mup_segment_direct_behavior_cmd);
+	install_element(BGP_IPV6_MUP_SEGMENT_DIRECT_NODE, &af_mup_segment_direct_segment_id_cmd);
 }
 
 /* Emit every per-(vrf, afi) BGP-MUP policy line under
@@ -3299,6 +4420,20 @@ void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi)
 
 	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK))
 		vty_out(vty, "  segment interwork\n");
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_DIRECT)) {
+		vty_out(vty, "  segment direct\n");
+		if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_DSD_ADDRESS_SET))
+			vty_out(vty, "   address %pI4\n", &ep->dsd_address.ipaddr_v4);
+		if (ep->dsd_behavior == SRV6_ENDPOINT_BEHAVIOR_END_DT4)
+			vty_out(vty, "   behavior dt4\n");
+		else if (ep->dsd_behavior == SRV6_ENDPOINT_BEHAVIOR_END_DT6)
+			vty_out(vty, "   behavior dt6\n");
+		else if (ep->dsd_behavior == SRV6_ENDPOINT_BEHAVIOR_END_DT46)
+			vty_out(vty, "   behavior dt46\n");
+		if (ep->dsd_mup_str)
+			vty_out(vty, "   segment-id %s\n", ep->dsd_mup_str);
+		vty_out(vty, "  exit\n");
+	}
 	if (ep->vrftable)
 		vty_out(vty, "  segment vrftable %u\n", ep->vrftable);
 }
