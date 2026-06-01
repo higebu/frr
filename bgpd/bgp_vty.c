@@ -23015,6 +23015,22 @@ static struct cmd_node bgp_mupv6_node = {
 	.no_xpath = true,
 };
 
+static struct cmd_node bgp_mupv4_segment_direct_node = {
+	.name = "bgp ipv4 mup segment direct",
+	.node = BGP_MUPV4_SEGMENT_DIRECT_NODE,
+	.parent_node = BGP_MUPV4_NODE,
+	.prompt = "%s(config-router-af-mup-segment-direct)# ",
+	.no_xpath = true,
+};
+
+static struct cmd_node bgp_mupv6_segment_direct_node = {
+	.name = "bgp ipv6 mup segment direct",
+	.node = BGP_MUPV6_SEGMENT_DIRECT_NODE,
+	.parent_node = BGP_MUPV6_NODE,
+	.prompt = "%s(config-router-af-mup-segment-direct)# ",
+	.no_xpath = true,
+};
+
 static void community_list_vty(void);
 
 static void bgp_ac_peergroup(vector comps, struct cmd_token *token)
@@ -23469,6 +23485,8 @@ void bgp_vty_init(void)
 	install_node(&bgp_ls_node);
 	install_node(&bgp_mupv4_node);
 	install_node(&bgp_mupv6_node);
+	install_node(&bgp_mupv4_segment_direct_node);
+	install_node(&bgp_mupv6_segment_direct_node);
 
 	/* Install default VTY commands to new nodes.  */
 	install_default(BGP_NODE);
@@ -23490,6 +23508,8 @@ void bgp_vty_init(void)
 	install_default(BGP_LS_NODE);
 	install_default(BGP_MUPV4_NODE);
 	install_default(BGP_MUPV6_NODE);
+	install_default(BGP_MUPV4_SEGMENT_DIRECT_NODE);
+	install_default(BGP_MUPV6_SEGMENT_DIRECT_NODE);
 
 	/* "global bgp inq-limit command */
 	install_element(CONFIG_NODE, &bgp_inq_limit_cmd);
