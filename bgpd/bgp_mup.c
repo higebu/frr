@@ -18,6 +18,7 @@
 #include "bgpd/bgp_ecommunity.h"
 #include "bgpd/bgp_errors.h"
 #include "bgpd/bgp_mup.h"
+#include "bgpd/bgp_nht.h"
 #include "bgpd/bgp_rd.h"
 #include "bgpd/bgp_route.h"
 #include "bgpd/bgp_table.h"
@@ -169,6 +170,13 @@ void bgp_mup_export_clear(struct bgp *bgp, afi_t afi)
 	XFREE(MTYPE_BGP_NAME, p->dsd_mup_str);
 	XFREE(MTYPE_BGP_MUP_EXPORT, bgp->mup_export[afi]);
 }
+
+/* ISD leak entry points, defined alongside bgp_nlri_parse_mup below;
+ * forward-declared so the SID-arrival and locator-delete hooks here
+ * can drive emit/withdraw without reordering the file.
+ */
+static void mup_leak_from_vrf_update_all(struct bgp *to_bgp, struct bgp *from_bgp, afi_t afi);
+static void mup_leak_from_vrf_withdraw_all(struct bgp *to_bgp, struct bgp *from_bgp, afi_t afi);
 
 /* Map per-(vrf, afi) ISD origination to its SRv6 Mobile action: the
  * AFI of the leaked prefix selects End.M.GTP4.E (IPv4) or
@@ -362,7 +370,10 @@ bool bgp_mup_handle_sid_alloc(struct bgp *bgp, const struct srv6_sid_ctx *ctx,
 
 	bgp_mup_export_arm_sid(bgp, afi, ep, locator_bgp, sid);
 
-	/* ISD UPDATE emit is wired up in a following commit. */
+	/* SID is armed and the local SID installed; emit the ISD NLRIs
+	 * for every locally-originated MUP-RIB prefix in this (vrf, afi).
+	 */
+	mup_leak_from_vrf_update_all(bgp_get_default(), bgp, afi);
 	return true;
 }
 
@@ -401,6 +412,10 @@ void bgp_mup_locator_delete_purge(struct bgp *bgp, const struct srv6_locator *lo
 		if (strcmp(ep->tovpn_sid_locator->name, locator->name) != 0)
 			continue;
 
+		/* Withdraw the advertised ISDs before the SID disappears,
+		 * then uninstall the local SID and drop the cached state.
+		 */
+		mup_leak_from_vrf_withdraw_all(bgp_get_default(), bgp, afi);
 		bgp_mup_install_isd_localsid(bgp, afi, true);
 
 		XFREE(MTYPE_BGP_SRV6_SID, ep->tovpn_sid);
@@ -2194,6 +2209,433 @@ static void bgp_mup_schedule_reannounce_st_routes(struct bgp *bgp, afi_t afi)
 			&bgp->mup_reannounce_ev[afi]);
 }
 
+/* Fill the flat SAFI_MUP RIB lookup key from the 8 RD octets carried
+ * in an ISD NLRI.  SAFI_MUP keeps a single table keyed by the NLRI
+ * itself; the prd is only the handle bgp_afi_node_get and
+ * bgp_safi_node_lookup expect.
+ */
+static void bgp_mup_prd_from_bytes(struct prefix_rd *prd, const uint8_t *rd)
+{
+	prd->family = AF_UNSPEC;
+	prd->prefixlen = 64;
+	memcpy(prd->val, rd, 8);
+}
+
+/* Build the locally-originated attribute for an ISD NLRI: an IPv6
+ * MP_REACH next-hop, the SRv6 L3 Service Prefix-SID TLV carrying the
+ * shared End.M.GTP{4,6}.E SID, and the export RT ecommunity.  Mirrors
+ * the attribute L3VPN stamps in vpn_leak_from_vrf_update.  Returns an
+ * interned attr the caller hands to bgp_mup_originate_common.
+ */
+static struct attr *bgp_mup_local_attr(struct bgp *bgp, const struct in6_addr *sid,
+				       uint16_t endpoint_behavior, uint8_t loc_block_len,
+				       uint8_t loc_node_len, uint8_t func_len, uint8_t arg_len,
+				       struct ecommunity *ecom,
+				       const struct in6_addr *nexthop_override)
+{
+	struct bgp_attr_srv6_l3service *l3;
+	struct attr attr = {};
+
+	bgp_attr_default_set(&attr, bgp, BGP_ORIGIN_INCOMPLETE);
+
+	/* MUP NLRI carries an IPv6 next-hop on the wire; an unset policy
+	 * leaves it zero, matching L3VPN's TOVPN_NEXTHOP default posture.
+	 */
+	attr.mp_nexthop_len = BGP_ATTR_NHLEN_IPV6_GLOBAL;
+	if (nexthop_override)
+		attr.mp_nexthop_global = *nexthop_override;
+
+	l3 = XCALLOC(MTYPE_BGP_SRV6_L3SERVICE, sizeof(*l3));
+	l3->sid = *sid;
+	l3->endpoint_behavior = endpoint_behavior;
+	l3->loc_block_len = loc_block_len;
+	l3->loc_node_len = loc_node_len;
+	l3->func_len = func_len;
+	l3->arg_len = arg_len;
+	attr.srv6_l3service = l3;
+	SET_FLAG(attr.flag, ATTR_FLAG_BIT(BGP_ATTR_PREFIX_SID));
+
+	if (ecom) {
+		bgp_attr_set_ecommunity(&attr, ecommunity_dup(ecom));
+		SET_FLAG(attr.flag, ATTR_FLAG_BIT(BGP_ATTR_EXT_COMMUNITIES));
+	}
+
+	return bgp_attr_intern(&attr);
+}
+
+/* Inject or withdraw a locally-originated NLRI in the default-vrf
+ * SAFI_MUP RIB.  Withdraw removes the BGP_ROUTE_STATIC path this
+ * originator owns; the update path interns @attr and either refreshes
+ * the existing self-path in place or adds a new one.  Lifted from the
+ * L3VPN vpn_leak_from_vrf_update RIB mechanics; the dataplane local
+ * SID is installed separately by bgp_mup_handle_sid_alloc.
+ */
+static int bgp_mup_originate_common(struct bgp *bgp, afi_t afi, struct prefix_mup *p,
+				    struct attr *attr, bool withdraw)
+{
+	struct bgp *to_bgp = (bgp->vrf_id == VRF_DEFAULT) ? bgp : bgp_get_default();
+	struct prefix_rd prd = {};
+	struct bgp_dest *dest;
+	struct bgp_path_info *pi;
+	struct attr *attr_new;
+	struct bgp_path_info *new;
+
+	if (!to_bgp) {
+		zlog_err("BGP-MUP: no default-vrf bgp instance to advertise via");
+		return -1;
+	}
+
+	bgp_mup_prd_from_bytes(&prd, p->prefix.rd);
+
+	if (withdraw) {
+		dest = bgp_safi_node_lookup(to_bgp->rib[afi][SAFI_MUP], SAFI_MUP,
+					    (struct prefix *)p, &prd);
+		if (!dest)
+			return 0;
+
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+			if (pi->peer == to_bgp->peer_self && pi->type == ZEBRA_ROUTE_BGP &&
+			    pi->sub_type == BGP_ROUTE_STATIC)
+				break;
+
+		if (pi) {
+			bgp_aggregate_decrement(to_bgp, (struct prefix *)p, pi, afi, SAFI_MUP);
+			bgp_unlink_nexthop(pi);
+			bgp_path_info_mark_for_delete(dest, pi);
+			bgp_process(to_bgp, dest, pi, afi, SAFI_MUP);
+		}
+		bgp_dest_unlock_node(dest);
+		return 0;
+	}
+
+	dest = bgp_afi_node_get(to_bgp->rib[afi][SAFI_MUP], afi, SAFI_MUP, (struct prefix *)p, &prd);
+	attr_new = bgp_attr_intern(attr);
+
+	for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+		if (pi->peer == to_bgp->peer_self && pi->type == ZEBRA_ROUTE_BGP &&
+		    pi->sub_type == BGP_ROUTE_STATIC)
+			break;
+
+	if (pi) {
+		if (attrhash_cmp(pi->attr, attr_new) && !CHECK_FLAG(pi->flags, BGP_PATH_REMOVED)) {
+			bgp_attr_unintern(&attr_new);
+			bgp_dest_unlock_node(dest);
+			return 0;
+		}
+		/* Refresh: swap the attribute in place and re-run selection. */
+		bgp_path_info_set_flag(dest, pi, BGP_PATH_ATTR_CHANGED);
+		bgp_attr_unintern(&pi->attr);
+		pi->attr = attr_new;
+		pi->uptime = monotime(NULL);
+		SET_FLAG(pi->flags, BGP_PATH_VALID);
+		bgp_path_info_unset_flag(dest, pi, BGP_PATH_REMOVED);
+		bgp_process(to_bgp, dest, pi, afi, SAFI_MUP);
+		bgp_dest_unlock_node(dest);
+		return 0;
+	}
+
+	new = info_make(ZEBRA_ROUTE_BGP, BGP_ROUTE_STATIC, 0, to_bgp->peer_self, attr_new, dest);
+	SET_FLAG(new->flags, BGP_PATH_VALID);
+	bgp_path_info_add(dest, new);
+	bgp_aggregate_increment(to_bgp, (struct prefix *)p, new, afi, SAFI_MUP);
+	bgp_dest_unlock_node(dest);
+	bgp_process(to_bgp, dest, new, afi, SAFI_MUP);
+	return 0;
+}
+
+/* The default route is never an ISD candidate: ISD advertises N3
+ * (gNB-side) reachability prefixes only, per draft-ietf-bess-mup-safi.
+ */
+static bool bgp_mup_origin_skip_prefix(const struct prefix *p)
+{
+	return !p || p->prefixlen == 0;
+}
+
+/* Resolve the export policy that makes (bgp_vrf, afi) an active ISD
+ * originator: a non-default VRF instance with an RD configured and
+ * `segment interwork` selected.  Returns NULL otherwise.  Mirrors
+ * L3VPN's "is this (vrf, afi) leaking to vpn" predicate.
+ */
+static struct bgp_mup_export_policy *bgp_mup_origin_active(struct bgp *bgp_vrf, afi_t afi)
+{
+	struct bgp_mup_export_policy *ep;
+
+	if (!bgp_vrf || bgp_vrf->vrf_id == VRF_DEFAULT)
+		return NULL;
+	if (afi != AFI_IP && afi != AFI_IP6)
+		return NULL;
+	ep = bgp_mup_export_peek(bgp_vrf, afi);
+	if (!ep)
+		return NULL;
+	if (!CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_RD_SET))
+		return NULL;
+	if (!CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK))
+		return NULL;
+	return ep;
+}
+
+/* Arguments threaded from a leaked unicast/MUP-RIB prefix into the
+ * ISD emit path.  @ecom is borrowed (the policy's export RT list),
+ * not owned.
+ */
+struct bgp_mup_origin_args {
+	afi_t afi;
+	struct prefix_rd prd;
+	struct prefix isd_prefix;
+	struct ecommunity *ecom;
+};
+
+/* Build one ISD NLRI for @args and submit it to the default-vrf MUP
+ * RIB.  @from_bgp is the originating per-VRF instance whose
+ * mup_export[afi] policy carries the shared End.M.GTP{4,6}.E SID; the
+ * SID structure lengths come from @from_bgp's locator.  Control-plane
+ * only: the matching local SID is installed by the SID-arrival hook.
+ */
+static int bgp_mup_emit_isd(struct bgp *to_bgp, struct bgp *from_bgp,
+			    const struct bgp_mup_origin_args *args, const struct in6_addr *sid,
+			    bool withdraw)
+{
+	struct bgp_mup_export_policy *ep;
+	struct prefix_mup p = {};
+	struct attr *attr = NULL;
+	struct srv6_locator *loc = NULL;
+	uint16_t behavior = 0;
+	uint8_t prefix_octets;
+	int ret;
+
+	prefix_octets = PSIZE(args->isd_prefix.prefixlen);
+	bgp_mup_prefix_init(&p, BGP_MUP_ISD_ROUTE, 8 + 1 + prefix_octets);
+	memcpy(p.prefix.rd, args->prd.val, 8);
+	p.prefix.isd_route.ip_prefix_length = args->isd_prefix.prefixlen;
+	if (args->afi == AFI_IP) {
+		p.prefix.isd_route.ip.ipa_type = IPADDR_V4;
+		p.prefix.isd_route.ip.ipaddr_v4 = args->isd_prefix.u.prefix4;
+	} else {
+		p.prefix.isd_route.ip.ipa_type = IPADDR_V6;
+		p.prefix.isd_route.ip.ipaddr_v6 = args->isd_prefix.u.prefix6;
+	}
+
+	if (!withdraw) {
+		struct in6_addr nh_storage = {};
+		const struct in6_addr *nh = NULL;
+
+		loc = bgp_srv6_locator_lookup(from_bgp, bgp_get_default());
+		if (!loc)
+			return -1;
+		behavior = (args->afi == AFI_IP) ? SRV6_ENDPOINT_BEHAVIOR_END_M_GTP4_E
+						 : SRV6_ENDPOINT_BEHAVIOR_END_M_GTP6_E;
+
+		ep = bgp_mup_export_peek(from_bgp, args->afi);
+		if (ep && CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_NEXTHOP_SET)) {
+			if (ep->tovpn_nexthop.family == AF_INET6) {
+				nh_storage = ep->tovpn_nexthop.u.prefix6;
+				nh = &nh_storage;
+			} else if (ep->tovpn_nexthop.family == AF_INET) {
+				nh_storage.s6_addr[10] = 0xff;
+				nh_storage.s6_addr[11] = 0xff;
+				memcpy(&nh_storage.s6_addr[12], &ep->tovpn_nexthop.u.prefix4, 4);
+				nh = &nh_storage;
+			}
+		}
+		attr = bgp_mup_local_attr(to_bgp, sid, behavior, loc->block_bits_length,
+					  loc->node_bits_length, loc->function_bits_length,
+					  loc->argument_bits_length, args->ecom, nh);
+	}
+	ret = bgp_mup_originate_common(to_bgp, args->afi, &p, attr, withdraw);
+
+	/* Seed the default-vrf ISD discovery cache with the locally-
+	 * originated entry so a T1ST received on this node (self-origin)
+	 * resolves against it, mirroring the cache upsert the receive path
+	 * performs for ISDs learned from a peer.
+	 */
+	if (withdraw)
+		bgp_mup_isd_cache_remove(to_bgp, args->afi, &args->prd, &args->isd_prefix);
+	else if (loc)
+		bgp_mup_isd_cache_upsert(to_bgp, args->afi, &args->prd, &args->isd_prefix, sid,
+					 loc->block_bits_length, loc->node_bits_length,
+					 loc->function_bits_length, loc->argument_bits_length,
+					 behavior);
+	return ret;
+}
+
+/* Leak one locally-originated MUP-RIB path from @from_bgp into an ISD
+ * advertisement.  Gated on an active interwork policy, an armed SID,
+ * a non-default prefix, and the export-side route-map.  The route-map
+ * is filter-only: the emitted ISD attribute is rebuilt from policy
+ * (SID/RT/nexthop), so set-clauses cannot ride through to the wire.
+ */
+static void mup_leak_from_vrf_update(struct bgp *to_bgp, struct bgp *from_bgp,
+				     struct bgp_path_info *path_vrf)
+{
+	struct bgp_mup_export_policy *ep;
+	struct bgp_mup_origin_args args = {};
+	const struct prefix *p;
+	afi_t afi;
+
+	if (!to_bgp || !from_bgp || !path_vrf || !path_vrf->net)
+		return;
+	p = bgp_dest_get_prefix(path_vrf->net);
+	afi = family2afi(p->family);
+	if (bgp_mup_origin_skip_prefix(p))
+		return;
+
+	ep = bgp_mup_origin_active(from_bgp, afi);
+	if (!ep)
+		return;
+
+	/* Locally-originated MUP entries (BGP_ROUTE_STATIC from `network`,
+	 * BGP_ROUTE_REDISTRIBUTE from `redistribute`) are valid ISD
+	 * sources as soon as they land; selection runs asynchronously, so
+	 * gating on BGP_PATH_VALID would race the SID-arrival replay.
+	 * Skip only paths actively being removed or suppressed.
+	 */
+	if (CHECK_FLAG(path_vrf->flags, BGP_PATH_REMOVED))
+		return;
+	if (bgp_path_suppressed(path_vrf))
+		return;
+
+	if (!ep->tovpn_sid_ready)
+		return; /* defer: SID-arrival hook replays via update_all */
+
+	if (ep->rmap[BGP_MUP_POLICY_DIR_TOMUP]) {
+		struct bgp_path_info info;
+		struct bgp_path_info_extra path_extra;
+		struct attr static_attr = *path_vrf->attr;
+		struct peer *peer = path_vrf->peer ? path_vrf->peer : to_bgp->peer_self;
+		route_map_result_t rmap_ret;
+
+		prep_for_rmap_apply(&info, &path_extra, path_vrf->net, path_vrf, peer, NULL,
+				    &static_attr);
+		rmap_ret = route_map_apply(ep->rmap[BGP_MUP_POLICY_DIR_TOMUP], p, &info);
+		bgp_attr_flush(&static_attr);
+		if (rmap_ret == RMAP_DENYMATCH)
+			return;
+	}
+
+	args.afi = afi;
+	args.prd = ep->tovpn_rd;
+	args.ecom = ep->rtlist[BGP_MUP_POLICY_DIR_TOMUP];
+	args.isd_prefix = *p;
+	(void)bgp_mup_emit_isd(to_bgp, from_bgp, &args, ep->tovpn_sid, false);
+}
+
+/* Walk @from_bgp's locally-originated (afi, SAFI_MUP) entries and emit
+ * an ISD advertisement for each.  Entries land here via `network` and
+ * `redistribute` under the MUP AF; the sub_type check is the
+ * locally-originated filter.  Called on SID arrival and on a
+ * `segment interwork` postchange.
+ */
+static void mup_leak_from_vrf_update_all(struct bgp *to_bgp, struct bgp *from_bgp, afi_t afi)
+{
+	struct bgp_dest *bn;
+	struct bgp_path_info *bpi;
+
+	if (!to_bgp || !from_bgp)
+		return;
+	if (from_bgp->vrf_id == VRF_DEFAULT)
+		return;
+	if (afi != AFI_IP && afi != AFI_IP6)
+		return;
+	if (!from_bgp->rib[afi][SAFI_MUP])
+		return;
+
+	for (bn = bgp_table_top(from_bgp->rib[afi][SAFI_MUP]); bn; bn = bgp_route_next(bn)) {
+		for (bpi = bgp_dest_get_bgp_path_info(bn); bpi; bpi = bpi->next) {
+			if (bpi->sub_type != BGP_ROUTE_STATIC &&
+			    bpi->sub_type != BGP_ROUTE_REDISTRIBUTE)
+				continue;
+			mup_leak_from_vrf_update(to_bgp, from_bgp, bpi);
+		}
+	}
+}
+
+/* Withdraw the ISD advertisement that mup_leak_from_vrf_update would
+ * have emitted for @path_vrf.  Unlike the update path this does not
+ * gate on tovpn_sid_ready: the SID may already be gone (locator
+ * delete), and the originate-common withdraw is a no-op when no
+ * self-path exists.
+ */
+static void mup_leak_from_vrf_withdraw(struct bgp *to_bgp, struct bgp *from_bgp,
+				       struct bgp_path_info *path_vrf)
+{
+	struct bgp_mup_export_policy *ep;
+	struct bgp_mup_origin_args args = {};
+	const struct prefix *p;
+	afi_t afi;
+
+	if (!to_bgp || !from_bgp || !path_vrf || !path_vrf->net)
+		return;
+	p = bgp_dest_get_prefix(path_vrf->net);
+	afi = family2afi(p->family);
+	if (bgp_mup_origin_skip_prefix(p))
+		return;
+
+	ep = bgp_mup_origin_active(from_bgp, afi);
+	if (!ep)
+		return;
+
+	args.afi = afi;
+	args.prd = ep->tovpn_rd;
+	args.isd_prefix = *p;
+	(void)bgp_mup_emit_isd(to_bgp, from_bgp, &args, ep->tovpn_sid, true);
+}
+
+/* Withdraw every ISD advertisement originated from @from_bgp's
+ * (afi, SAFI_MUP) RIB.  Called on a `segment interwork` prechange and
+ * on locator delete.
+ */
+static void mup_leak_from_vrf_withdraw_all(struct bgp *to_bgp, struct bgp *from_bgp, afi_t afi)
+{
+	struct bgp_dest *bn;
+	struct bgp_path_info *bpi;
+
+	if (!to_bgp || !from_bgp)
+		return;
+	if (from_bgp->vrf_id == VRF_DEFAULT)
+		return;
+	if (afi != AFI_IP && afi != AFI_IP6)
+		return;
+	if (!from_bgp->rib[afi][SAFI_MUP])
+		return;
+
+	for (bn = bgp_table_top(from_bgp->rib[afi][SAFI_MUP]); bn; bn = bgp_route_next(bn)) {
+		for (bpi = bgp_dest_get_bgp_path_info(bn); bpi; bpi = bpi->next) {
+			if (bpi->sub_type != BGP_ROUTE_STATIC &&
+			    bpi->sub_type != BGP_ROUTE_REDISTRIBUTE)
+				continue;
+			mup_leak_from_vrf_withdraw(to_bgp, from_bgp, bpi);
+		}
+	}
+}
+
+/* Drop every ISD advertisement before an origination-affecting config
+ * change so stale NLRIs do not linger.  Sibling of L3VPN's
+ * vpn_leak_prechange.
+ */
+static void mup_leak_prechange(afi_t afi, struct bgp *bgp)
+{
+	struct bgp *to_bgp = bgp_get_default();
+
+	if (!to_bgp || !bgp)
+		return;
+	mup_leak_from_vrf_withdraw_all(to_bgp, bgp, afi);
+}
+
+/* Re-arm the shared SID and re-emit every ISD advertisement after an
+ * origination-affecting config change.  Sibling of L3VPN's
+ * vpn_leak_postchange.  When the SID is not yet ready the emit pass is
+ * a no-op and the SID-arrival hook replays it later.
+ */
+static void mup_leak_postchange(afi_t afi, struct bgp *bgp)
+{
+	struct bgp *to_bgp = bgp_get_default();
+
+	if (!to_bgp || !bgp)
+		return;
+	bgp_mup_request_isd_sid(bgp, afi);
+	mup_leak_from_vrf_update_all(to_bgp, bgp, afi);
+}
+
 int bgp_nlri_parse_mup(struct peer *peer, struct attr *attr, struct bgp_nlri *packet, int withdraw)
 {
 	uint8_t *pnt;
@@ -2714,6 +3156,52 @@ ALIAS (af_mup_segment_vrftable,
        "Segment routing underlay configuration for this MUP address-family\n"
        "SR-underlay VRF table id (SEG6_MOBILE_VRFTABLE)\n")
 
+/* `segment interwork` under `address-family ipv[46] mup` toggles
+ * Interwork Segment Discovery origination for this (vrf, afi): every
+ * locally-originated MUP-RIB prefix (`network` / `redistribute`) is
+ * advertised as an ISD route carrying the shared End.M.GTP*.E SID.
+ * Per draft-ietf-bess-mup-safi origination runs on a non-default vrf
+ * instance; the prechange/postchange bracket withdraws stale ISDs and
+ * re-emits under the new policy, matching L3VPN's vpn_leak bracket.
+ */
+DEFPY (af_mup_segment_interwork,
+       af_mup_segment_interwork_cmd,
+       "[no] segment interwork",
+       NO_STR
+       "Segment routing origination mode for this MUP address-family\n"
+       "Enable Interwork Segment Discovery (per-prefix ISD) origination\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	struct bgp_mup_export_policy *ep;
+	afi_t afi;
+	int idx = 0;
+	bool yes = !argv_find(argv, argc, "no", &idx);
+
+	if (vty->node == BGP_IPV4_MUP_NODE)
+		afi = AFI_IP;
+	else if (vty->node == BGP_IPV6_MUP_NODE)
+		afi = AFI_IP6;
+	else {
+		vty_out(vty, "%% segment interwork only valid under address-family ipv4|ipv6 mup\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	if (bgp->vrf_id == VRF_DEFAULT) {
+		vty_out(vty,
+			"%% segment interwork must be configured under a non-default vrf bgp instance; the default-vrf instance only carries the BGP-MUP session\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}
+
+	mup_leak_prechange(afi, bgp);
+	ep = bgp_mup_export_get(bgp, afi);
+	if (yes)
+		SET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK);
+	else
+		UNSET_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK);
+	mup_leak_postchange(afi, bgp);
+	return CMD_SUCCESS;
+}
+
 void bgp_mup_vty_init(void)
 {
 	install_element(BGP_IPV4_MUP_NODE, &af_rt_mup_cmd);
@@ -2740,13 +3228,16 @@ void bgp_mup_vty_init(void)
 	install_element(BGP_IPV4_MUP_NODE, &af_no_mup_segment_vrftable_cmd);
 	install_element(BGP_IPV6_MUP_NODE, &af_mup_segment_vrftable_cmd);
 	install_element(BGP_IPV6_MUP_NODE, &af_no_mup_segment_vrftable_cmd);
+
+	install_element(BGP_IPV4_MUP_NODE, &af_mup_segment_interwork_cmd);
+	install_element(BGP_IPV6_MUP_NODE, &af_mup_segment_interwork_cmd);
 }
 
 /* Emit every per-(vrf, afi) BGP-MUP policy line under
  * `address-family ipv[46] mup`.  Origination knobs (rd / rt / sid /
- * nexthop) are written on the non-default vrf instance; segment
- * vrftable on the default-vrf instance.  All BGP-MUP config is
- * self-contained in the MUP AF; nothing is emitted under
+ * nexthop / segment interwork) are written on the non-default vrf
+ * instance; segment vrftable on the default-vrf instance.  All BGP-MUP
+ * config is self-contained in the MUP AF; nothing is emitted under
  * `address-family ipv[46] unicast`.
  */
 void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi)
@@ -2806,6 +3297,8 @@ void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi)
 			vty_out(vty, "  nexthop %pI6\n", &ep->tovpn_nexthop.u.prefix6);
 	}
 
+	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SEGMENT_INTERWORK))
+		vty_out(vty, "  segment interwork\n");
 	if (ep->vrftable)
 		vty_out(vty, "  segment vrftable %u\n", ep->vrftable);
 }
