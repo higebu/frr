@@ -23,6 +23,8 @@ PREDECL_LIST(zebra_l2_vni);
 PREDECL_HASH(bgp_mup_isd_hash);
 PREDECL_HASH(bgp_mup_dsd_hash);
 PREDECL_HASH(bgp_mup_dsd_segid_hash);
+PREDECL_LIST(bgp_mup_pending_list);
+PREDECL_LIST(bgp_mup_origin_list);
 struct bgp_mup_export_policy;
 
 struct route_table;
@@ -1118,6 +1120,16 @@ struct bgp {
 	struct route_table *mup_isd_lpm[AFI_MAX];
 	struct bgp_mup_dsd_hash_head *mup_dsd_hash;
 	struct bgp_mup_dsd_segid_hash_head *mup_dsd_segid_hash;
+
+	/* BGP-MUP DSD origination state.  pending parks the operator's
+	 * `segment direct` args while an auto-allocated SID is in flight
+	 * from zebra's SRv6 SID manager; origins persists the configured
+	 * `segment direct` lines so they survive SID-alloc cycles and
+	 * replay after a locator (re)arrival.  Lazily allocated by
+	 * bgp_mup.c, drained in bgp_mup_caches_free().
+	 */
+	struct bgp_mup_pending_list_head *mup_pending;
+	struct bgp_mup_origin_list_head *mup_origins;
 
 	/* BGP-MUP discovery cache: pending coalesced reannounce of T1ST/T2ST
 	 * paths after ISD/DSD cache mutation.  One slot per AFI; a flood of
