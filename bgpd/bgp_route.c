@@ -51,6 +51,7 @@
 #include "bgpd/bgp_filter.h"
 #include "bgpd/bgp_fsm.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_nexthop.h"
 #include "bgpd/bgp_damp.h"
 #include "bgpd/bgp_advertise.h"
@@ -9073,6 +9074,10 @@ void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 				vpn_leak_from_vrf_update(bgp_get_default(), bgp,
 							 pi);
 			}
+			if (safi == SAFI_MUP
+			    && (bgp->inst_type == BGP_INSTANCE_TYPE_VRF
+				|| bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT))
+				bgp_mup_vrf_update(bgp, pi);
 			if (advertise_type5_routes_multipath(bgp, afi) &&
 			    is_route_injectable_into_evpn(bgp, afi, safi, pi))
 				bgp_evpn_export_type5_route(bgp, dest, pi, afi, safi);
@@ -9123,6 +9128,11 @@ void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 	     bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
 		vpn_leak_from_vrf_update(bgp_get_default(), bgp, new);
 	}
+
+	if (safi == SAFI_MUP &&
+	    (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+	     bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT))
+		bgp_mup_vrf_update(bgp, new);
 
 	if (SAFI_MPLS_VPN == safi &&
 	    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT) {
@@ -9178,6 +9188,10 @@ void bgp_static_withdraw(struct bgp *bgp, const struct prefix *p, afi_t afi,
 		     bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
 			vpn_leak_from_vrf_withdraw(bgp_get_default(), bgp, pi);
 		}
+		if (safi == SAFI_MUP &&
+		    (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+		     bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT))
+			bgp_mup_vrf_withdraw(bgp, pi);
 		if (SAFI_MPLS_VPN == safi
 		    && bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT) {
 			vpn_leak_to_vrf_withdraw(pi);
@@ -12081,6 +12095,10 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr 
 						bgp_evpn_export_type5_route(bgp, bn, bpi, afi,
 									    safi);
 					bgp_ls_originate_bgp_prefix(bgp, afi, safi, bn, bpi);
+				} else if (safi == SAFI_MUP &&
+					   (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+					    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
+					bgp_mup_vrf_update(bgp, bpi);
 				}
 				continue;
 			}
@@ -12106,6 +12124,10 @@ void bgp_redistribute_add(struct bgp *bgp, struct prefix *p, const union g_addr 
 				bgp_evpn_export_type5_route(bgp, bn, new, afi, safi);
 			if (bgp->ls_info && bgp->ls_info->enable_distribution)
 				bgp_ls_originate_bgp_prefix(bgp, afi, safi, bn, new);
+		} else if (safi == SAFI_MUP &&
+			   (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+			    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
+			bgp_mup_vrf_update(bgp, new);
 		}
 	}
 
@@ -12136,6 +12158,10 @@ static void bgp_redistribute_one_delete(struct bgp *bgp, struct bgp_redist *red,
 			    is_route_injectable_into_evpn(bgp, afi, safi, pi))
 				bgp_evpn_unexport_type5_route(bgp, dest, pi, afi, safi);
 			bgp_ls_withdraw_bgp_prefix(bgp, afi, safi, dest, pi);
+		} else if (safi == SAFI_MUP &&
+			   (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+			    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
+			bgp_mup_vrf_withdraw(bgp, pi);
 		}
 
 		bgp_aggregate_decrement(bgp, p, pi, afi, safi);
@@ -12198,6 +12224,10 @@ void bgp_redistribute_withdraw(struct bgp *bgp, afi_t afi, safi_t safi, int type
 				    is_route_injectable_into_evpn(bgp, afi, safi, pi))
 					bgp_evpn_unexport_type5_route(bgp, dest, pi, afi, safi);
 				bgp_ls_withdraw_bgp_prefix(bgp, afi, safi, dest, pi);
+			} else if (safi == SAFI_MUP &&
+				   (bgp->inst_type == BGP_INSTANCE_TYPE_VRF ||
+				    bgp->inst_type == BGP_INSTANCE_TYPE_DEFAULT)) {
+				bgp_mup_vrf_withdraw(bgp, pi);
 			}
 
 			bgp_aggregate_decrement(bgp, bgp_dest_get_prefix(dest), pi, afi, safi);
@@ -20529,6 +20559,7 @@ void bgp_route_init(void)
 
 	/* IPv4 labeled-unicast configuration.  */
 	install_element(BGP_IPV4L_NODE, &bgp_network_cmd);
+	install_element(BGP_MUPV4_NODE, &bgp_network_cmd);
 	install_element(BGP_IPV4L_NODE, &aggregate_addressv4_cmd);
 
 	install_element(VIEW_NODE, &show_ip_bgp_instance_all_cmd);
@@ -20581,6 +20612,7 @@ void bgp_route_init(void)
 
 	/* IPv6 labeled unicast address family. */
 	install_element(BGP_IPV6L_NODE, &ipv6_bgp_network_cmd);
+	install_element(BGP_MUPV6_NODE, &ipv6_bgp_network_cmd);
 	install_element(BGP_IPV6L_NODE, &aggregate_addressv6_cmd);
 
 	install_element(BGP_NODE, &bgp_distance_cmd);
