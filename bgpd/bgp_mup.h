@@ -92,4 +92,10 @@ void bgp_mup_vty_init(void);
  */
 void bgp_mup_iface_addr_change(vrf_id_t vrf_id);
 
+/* Emit the decomposed MUP NLRI fields (routeType / archType / rd / ip /
+ * ipLen / teid / qfi / endpointAddress) onto @json for `show bgp
+ * ipv[46] mup ... json`.
+ */
+void bgp_mup_route2json(const struct mup_prefix *mp, struct json_object *json);
+
 #endif /* _FRR_BGP_MUP_H */

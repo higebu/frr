@@ -11049,6 +11049,22 @@ static void route_vty_out_route(struct bgp_dest *dest, const struct prefix *p, s
 			json_object_string_add(json, "nlriStr", nlri_str);
 			json_object_object_add(json, "nlri", json_nlri);
 		}
+	} else if (p->family == AF_MUP) {
+		/* inet_ntop() has no AF_MUP renderer and returns NULL, which
+		 * crashes json_object_string_add(); the prefix carries its
+		 * own %pFX printer, so use it for both output modes.
+		 */
+		if (!json)
+			len = vty_out(vty, "%pFX", p);
+		else {
+			const struct prefix_mup *pm = (const struct prefix_mup *)p;
+
+			json_object_string_addf(json, "prefix", "%pFX", p);
+			json_object_int_add(json, "prefixLen", p->prefixlen);
+			json_object_string_addf(json, "network", "%pFX", p);
+			json_object_int_add(json, "version", dest->version);
+			bgp_mup_route2json(&pm->prefix, json);
+		}
 	} else {
 		if (!json)
 			len = vty_out(vty, "%pFX", p);
