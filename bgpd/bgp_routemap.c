@@ -44,6 +44,7 @@
 #include "bgpd/bgp_evpn_private.h"
 #include "bgpd/bgp_evpn_vty.h"
 #include "bgpd/bgp_mplsvpn.h"
+#include "bgpd/bgp_mup.h"
 #include "bgpd/bgp_pbr.h"
 #include "bgpd/bgp_flowspec_util.h"
 #include "bgpd/bgp_encap_types.h"
@@ -5033,6 +5034,7 @@ static void bgp_route_map_process_update_cb(char *rmap_name)
 	}
 
 	vpn_policy_routemap_event(rmap_name);
+	mup_policy_routemap_event(rmap_name);
 }
 
 void bgp_route_map_update_timer(struct event *event)
@@ -5069,6 +5071,7 @@ static void bgp_route_map_mark_update(const char *rmap_name)
 		}
 
 		vpn_policy_routemap_event(rmap_name);
+		mup_policy_routemap_event(rmap_name);
 	}
 }
 

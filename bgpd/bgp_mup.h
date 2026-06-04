@@ -47,6 +47,12 @@ void bgp_mup_export_clear(struct bgp *bgp, afi_t afi);
 void bgp_mup_vrf_update(struct bgp *from_bgp, struct bgp_path_info *pi);
 void bgp_mup_vrf_withdraw(struct bgp *from_bgp, struct bgp_path_info *pi);
 
+/* Re-resolve MUP route-map references and replay affected leak/install
+ * paths when a route-map body changes.  Called from the BGP route-map
+ * update dispatch (bgp_routemap.c), mirroring vpn_policy_routemap_event.
+ */
+void mup_policy_routemap_event(const char *rmap_name);
+
 /* SRv6 SID notify hook for the BGP-MUP origination path.  Returns
  * true when the notification matches a per-(vrf, afi) MUP policy
  * and has been consumed (the seg6_mobile-family local SID is now
