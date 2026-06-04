@@ -2736,6 +2736,108 @@ static void bgp_mup_zapi_init(struct zapi_route *api, struct bgp *bgp, struct bg
 	}
 }
 
+/* Build the inner forwarding prefix (UE / endpoint) carried by a MUP
+ * NLRI so the receive-side `route-map import` can match on it.  This is
+ * the prefix the install would put into the per-vrf RIB, not the MUP
+ * route key.
+ */
+static void bgp_mup_inner_prefix(const struct mup_prefix *mp, struct prefix *out)
+{
+	memset(out, 0, sizeof(*out));
+	switch (mp->route_type) {
+	case BGP_MUP_ISD_ROUTE:
+		out->family = (mp->isd_route.ip.ipa_type == IPADDR_V4) ? AF_INET : AF_INET6;
+		out->prefixlen = mp->isd_route.ip_prefix_length;
+		if (out->family == AF_INET)
+			out->u.prefix4 = mp->isd_route.ip.ipaddr_v4;
+		else
+			out->u.prefix6 = mp->isd_route.ip.ipaddr_v6;
+		break;
+	case BGP_MUP_DSD_ROUTE:
+		if (mp->dsd_route.ip.ipa_type == IPADDR_V4) {
+			out->family = AF_INET;
+			out->prefixlen = IPV4_MAX_BITLEN;
+			out->u.prefix4 = mp->dsd_route.ip.ipaddr_v4;
+		} else {
+			out->family = AF_INET6;
+			out->prefixlen = IPV6_MAX_BITLEN;
+			out->u.prefix6 = mp->dsd_route.ip.ipaddr_v6;
+		}
+		break;
+	case BGP_MUP_T1ST_ROUTE:
+		out->family = (mp->t1st_route.ip.ipa_type == IPADDR_V4) ? AF_INET : AF_INET6;
+		out->prefixlen = mp->t1st_route.ip_prefix_length;
+		if (out->family == AF_INET)
+			out->u.prefix4 = mp->t1st_route.ip.ipaddr_v4;
+		else
+			out->u.prefix6 = mp->t1st_route.ip.ipaddr_v6;
+		break;
+	case BGP_MUP_T2ST_ROUTE:
+		if (IS_IPADDR_V4(&mp->t2st_route.endpoint_address)) {
+			out->family = AF_INET;
+			out->prefixlen = IPV4_MAX_BITLEN;
+			out->u.prefix4 = mp->t2st_route.endpoint_address.ipaddr_v4;
+		} else {
+			out->family = AF_INET6;
+			out->prefixlen = IPV6_MAX_BITLEN;
+			out->u.prefix6 = mp->t2st_route.endpoint_address.ipaddr_v6;
+		}
+		break;
+	}
+}
+
+/* Apply the receive-side `route-map import` (rmap[FROMMUP]) of the VRF
+ * that imports this NLRI's RT before any install side-effects.  Returns
+ * true if the route should proceed to install, false if RMAP_DENYMATCH
+ * says skip.  No rmap configured (or no matched VRF) is PERMITMATCH.
+ *
+ * The matched VRF is the same one bgp_mup_match_install_vrf selects for
+ * the dataplane install, so the rmap applied here is the matched-install
+ * VRF's, not a per-VRF iteration.  When several non-default VRFs declare
+ * the same RT under `rt import`, only the first matched VRF's
+ * rmap[FROMMUP] runs.
+ */
+static bool bgp_mup_apply_import_rmap(afi_t afi, const struct mup_prefix *mp,
+				      struct bgp_path_info *info)
+{
+	vrf_id_t install_vrf_id;
+	struct bgp *vrf_bgp;
+	struct bgp_mup_export_policy *ep;
+	struct bgp_path_info tmp_info;
+	struct bgp_path_info_extra path_extra;
+	struct attr static_attr = {};
+	struct prefix p_inner;
+	struct peer *peer;
+	route_map_result_t rmap_ret;
+
+	if (!info || !info->attr)
+		return true;
+	install_vrf_id = bgp_mup_match_install_vrf(afi, info->attr);
+	if (install_vrf_id == VRF_UNKNOWN)
+		return true;
+	vrf_bgp = bgp_lookup_by_vrf_id(install_vrf_id);
+	if (!vrf_bgp)
+		return true;
+	ep = bgp_mup_export_peek(vrf_bgp, afi);
+	if (!ep || !ep->rmap[BGP_MUP_POLICY_DIR_FROMMUP])
+		return true;
+
+	bgp_mup_inner_prefix(mp, &p_inner);
+	bgp_attr_dup_into(&static_attr, info->attr);
+	peer = info->peer ? info->peer : vrf_bgp->peer_self;
+	prep_for_rmap_apply(&tmp_info, &path_extra, info->net, info, peer, NULL, &static_attr);
+	rmap_ret = route_map_apply(ep->rmap[BGP_MUP_POLICY_DIR_FROMMUP], &p_inner, &tmp_info);
+	bgp_attr_flush(&static_attr);
+	if (rmap_ret == RMAP_DENYMATCH) {
+		if (BGP_DEBUG(zebra, ZEBRA))
+			zlog_debug("BGP-MUP: route-map import on vrf %s denied %pFX (route_type %u); skip install",
+				   vrf_bgp->name ? vrf_bgp->name : "default", &p_inner,
+				   mp->route_type);
+		return false;
+	}
+	return true;
+}
+
 /* Move the nexthop the T1ST/T2ST resolution built into the interned
  * forwarding state that rides on the leaked unicast path.  bgp_zebra.c
  * rebuilds the zapi nexthop from it at announce time, the same way an
@@ -3035,6 +3137,18 @@ int bgp_mup_zebra_announce(struct bgp_dest *dest, struct bgp_path_info *info, st
 	mp = &pm->prefix;
 
 	afi = bgp_mup_afi_from_prefix(mp);
+
+	/* Receive-side `route-map import` gate, applied uniformly to every
+	 * MUP route type before it reaches the discovery cache (ISD/DSD)
+	 * or the install path (T1ST/T2ST).  A DENYMATCH skips this
+	 * re-announce; any prior cached/installed state is torn down by
+	 * the withdraw mup_import_replay issues ahead of the re-announce
+	 * when the route-map changes.  Denying an ISD/DSD also withdraws
+	 * the T1ST/T2ST that resolved against it via the cache-removal
+	 * reannounce cascade.
+	 */
+	if (!bgp_mup_apply_import_rmap(afi, mp, info))
+		return 0;
 
 	switch (mp->route_type) {
 	case BGP_MUP_ISD_ROUTE:
@@ -5075,6 +5189,173 @@ DEFPY (af_mup_segment_direct_segment_id,
 	return CMD_SUCCESS;
 }
 
+/* Re-evaluate the receive-side install of every locally-importing MUP
+ * path on @vrf_bgp/@afi.  Called when this VRF's `route-map import`
+ * (or its body) changes so already-received T1ST/T2ST routes pick up
+ * the new filter.  MUP installs are global SRv6 dataplane state, so the
+ * walk is single-pass over the default-instance MUP RIB rather than
+ * per-VRF.
+ */
+static void mup_import_replay(struct bgp *vrf_bgp, afi_t afi)
+{
+	struct bgp *default_bgp = bgp_get_default();
+	struct bgp_table *table;
+	struct bgp_dest *dest;
+
+	if (!default_bgp || !vrf_bgp)
+		return;
+	if (afi != AFI_IP && afi != AFI_IP6)
+		return;
+	table = default_bgp->rib[afi][SAFI_MUP];
+	if (!table)
+		return;
+
+	for (dest = bgp_table_top(table); dest; dest = bgp_route_next(dest)) {
+		const struct prefix *p = bgp_dest_get_prefix(dest);
+		struct bgp_path_info *pi;
+
+		if (p->family != AF_MUP)
+			continue;
+		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next) {
+			struct ecommunity *route_rt;
+
+			if (!CHECK_FLAG(pi->flags, BGP_PATH_SELECTED))
+				continue;
+			if (!pi->attr)
+				continue;
+			route_rt = bgp_attr_get_ecommunity(pi->attr);
+			if (!route_rt)
+				continue;
+			if (!bgp_mup_route_rt_in_import(vrf_bgp, afi, route_rt))
+				continue;
+			(void)bgp_mup_zebra_withdraw(dest, pi, default_bgp);
+			(void)bgp_mup_zebra_announce(dest, pi, default_bgp);
+			break;
+		}
+	}
+}
+
+/* Mirror af_route_map_vpn_imexport_cmd in bgpd/bgp_vty.c.  Like L3VPN,
+ * MUP's route-map DEFPY takes only <import|export> (no `both`).  The
+ * TOMUP slot filters VRF->MUP leaked ISD/DSD (mup_leak_from_vrf_update);
+ * the FROMMUP slot gates the receive-side install
+ * (bgp_mup_apply_import_rmap).
+ */
+DEFPY (af_mup_route_map,
+       af_mup_route_map_cmd,
+       "[no] route-map <import|export>$direction_str RMAP$rmap_str",
+       NO_STR
+       "Route-map to filter MUP routes\n"
+       "Apply on receive (gates per-VRF install)\n"
+       "Apply on origination (filters locally-emitted ISD/DSD)\n"
+       "Name of route-map\n")
+{
+	VTY_DECLVAR_CONTEXT(bgp, bgp);
+	afi_t afi = bgp_mup_export_node2afi(vty);
+	struct bgp_mup_export_policy *ep;
+	int dodir[BGP_MUP_POLICY_DIR_MAX] = {};
+	enum bgp_mup_policy_dir dir;
+	int idx = 0;
+	bool yes = true;
+	int ret;
+
+	if (argv_find(argv, argc, "no", &idx))
+		yes = false;
+
+	ret = bgp_mup_export_check_ctx(vty, bgp, afi);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	ret = mup_policy_getdirs(vty, direction_str, dodir);
+	if (ret != CMD_SUCCESS)
+		return ret;
+
+	for (dir = 0; dir < BGP_MUP_POLICY_DIR_MAX; ++dir) {
+		if (!dodir[dir])
+			continue;
+
+		if (dir == BGP_MUP_POLICY_DIR_TOMUP)
+			mup_leak_prechange(afi, bgp);
+
+		ep = bgp_mup_export_get(bgp, afi);
+		XFREE(MTYPE_BGP_NAME, ep->rmap_name[dir]);
+		ep->rmap[dir] = NULL;
+		if (yes) {
+			ep->rmap_name[dir] = XSTRDUP(MTYPE_BGP_NAME, rmap_str);
+			ep->rmap[dir] = route_map_lookup_warn_noexist(vty, rmap_str);
+		}
+
+		if (dir == BGP_MUP_POLICY_DIR_TOMUP)
+			mup_leak_postchange(afi, bgp);
+		else
+			mup_import_replay(bgp, afi);
+	}
+
+	return CMD_SUCCESS;
+}
+
+ALIAS (af_mup_route_map,
+       af_no_mup_route_map_cmd,
+       "no route-map <import|export>$direction_str",
+       NO_STR
+       "Route-map to filter MUP routes\n"
+       "Apply on receive (gates per-VRF install)\n"
+       "Apply on origination (filters locally-emitted ISD/DSD)\n")
+
+/* Re-resolve route-map pointers on every (bgp, afi) whose policy
+ * references @rmap_name and replay the affected leak/install paths so
+ * an edit / definition / deletion of a route-map body propagates to
+ * already-leaked ISD/DSD (TOMUP) and already-installed receive-side
+ * state (FROMMUP).  Mirrors vpn_policy_routemap_update in
+ * bgpd/bgp_mplsvpn.c.
+ */
+static void mup_policy_routemap_update(struct bgp *bgp, const char *rmap_name)
+{
+	struct route_map *rmap;
+	struct bgp_mup_export_policy *ep;
+	afi_t afi;
+	enum bgp_mup_policy_dir dir;
+
+	if (bgp->inst_type != BGP_INSTANCE_TYPE_DEFAULT &&
+	    bgp->inst_type != BGP_INSTANCE_TYPE_VRF)
+		return;
+
+	rmap = route_map_lookup_by_name(rmap_name); /* NULL if deleted */
+
+	for (afi = AFI_IP; afi < AFI_MAX; ++afi) {
+		ep = bgp_mup_export_peek(bgp, afi);
+		if (!ep)
+			continue;
+
+		for (dir = 0; dir < BGP_MUP_POLICY_DIR_MAX; ++dir) {
+			if (!ep->rmap_name[dir] ||
+			    strcmp(rmap_name, ep->rmap_name[dir]) != 0)
+				continue;
+
+			if (dir == BGP_MUP_POLICY_DIR_TOMUP)
+				mup_leak_prechange(afi, bgp);
+
+			ep->rmap[dir] = rmap;
+
+			if (dir == BGP_MUP_POLICY_DIR_TOMUP)
+				mup_leak_postchange(afi, bgp);
+			else
+				mup_import_replay(bgp, afi);
+		}
+	}
+}
+
+void mup_policy_routemap_event(const char *rmap_name)
+{
+	struct listnode *mnode, *mnnode;
+	struct bgp *bgp;
+
+	if (!bm || !bm->bgp)
+		return;
+	for (ALL_LIST_ELEMENTS(bm->bgp, mnode, mnnode, bgp))
+		mup_policy_routemap_update(bgp, rmap_name);
+}
+
 void bgp_mup_vty_init(void)
 {
 	install_element(BGP_MUPV4_NODE, &af_rt_mup_cmd);
@@ -5096,6 +5377,11 @@ void bgp_mup_vty_init(void)
 	install_element(BGP_MUPV6_NODE, &af_source_upf_prefix_len_mup_cmd);
 	install_element(BGP_MUPV4_NODE, &af_nexthop_mup_cmd);
 	install_element(BGP_MUPV6_NODE, &af_nexthop_mup_cmd);
+
+	install_element(BGP_MUPV4_NODE, &af_mup_route_map_cmd);
+	install_element(BGP_MUPV4_NODE, &af_no_mup_route_map_cmd);
+	install_element(BGP_MUPV6_NODE, &af_mup_route_map_cmd);
+	install_element(BGP_MUPV6_NODE, &af_no_mup_route_map_cmd);
 
 	install_element(BGP_MUPV4_NODE, &af_mup_segment_interwork_cmd);
 	install_element(BGP_MUPV6_NODE, &af_mup_segment_interwork_cmd);
@@ -5156,6 +5442,13 @@ void bgp_mup_config_write_af(struct vty *vty, struct bgp *bgp, afi_t afi)
 			XFREE(MTYPE_ECOMMUNITY_STR, b);
 		}
 	}
+
+	if (ep->rmap_name[BGP_MUP_POLICY_DIR_FROMMUP])
+		vty_out(vty, "  route-map import %s\n",
+			ep->rmap_name[BGP_MUP_POLICY_DIR_FROMMUP]);
+	if (ep->rmap_name[BGP_MUP_POLICY_DIR_TOMUP])
+		vty_out(vty, "  route-map export %s\n",
+			ep->rmap_name[BGP_MUP_POLICY_DIR_TOMUP]);
 
 	if (CHECK_FLAG(ep->flags, BGP_MUP_EXPORT_POLICY_SID_AUTO)) {
 		if (ep->locator_name)
