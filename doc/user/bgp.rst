@@ -4753,8 +4753,215 @@ Received routes are inspected with the following command:
    Display the BGP-MUP RIB for the selected sub-AFI.  The detailed
    per-prefix output decodes the TLVs carried with a route.
 
-Locally originating Mobile User Plane routes and installing
-received routes into the forwarding plane are not yet supported.
+Route Origination
+^^^^^^^^^^^^^^^^^
+
+Mobile User Plane routes are originated from a non-default VRF
+``router bgp`` instance.  An address family enables either
+``segment interwork`` for Interwork Segment Discovery, or
+``segment direct`` for Direct Segment Discovery.
+
+Interwork Segment Discovery advertises N3-side (gNB-facing) IP
+reachability through an interworking SRv6 endpoint.  Prefixes are
+injected with ``network`` and ``redistribute <protocol>`` under the
+Mobile User Plane address family, and every locally-originated
+entry produces one Interwork Segment Discovery route.
+
+Direct Segment Discovery advertises a direct-mode SRv6 endpoint for
+the VRF as a single route, used in the 3GPP 5G N6 / DN direction
+where no GTP-U interworking is required.
+
+A configured SRv6 locator must be referenced under
+``router bgp / segment-routing srv6 / locator <name>`` before
+origination is enabled.  When the route distinguisher and a segment
+selector are both set, FRR requests the necessary SRv6 SIDs from
+zebra and starts emitting routes.
+
+.. clicmd:: rd <AS:NN|IP:nn>
+
+   Route distinguisher attached to locally-originated routes.
+
+.. clicmd:: rt <import|export|both> RTLIST...
+
+   Route Target list applied to Mobile User Plane routes.
+   ``import`` matches received routes for installation into this
+   VRF; ``export`` is set on every locally-originated route;
+   ``both`` applies the list to both directions.
+
+.. clicmd:: route-map <import|export> RMAP
+
+   Route-map applied to received routes (``import``) or
+   locally-originated routes (``export``).
+
+.. clicmd:: sid <auto|explicit X:X::X:X> [locator NAME]
+
+   SRv6 prefix-SID attached to locally-originated routes.  ``auto``
+   requests a SID from the configured locator; ``explicit`` pins a
+   specific SID value.  The optional ``locator`` keyword overrides
+   the BGP instance default for this single address family.
+
+.. clicmd:: nexthop [A.B.C.D|X:X::X:X]
+
+   Override the next-hop carried on locally-originated routes.
+   IPv4 input is stored as an IPv4-mapped IPv6 address, since
+   Mobile User Plane routes always carry an IPv6 next-hop on the
+   wire.
+
+.. clicmd:: source-upf-prefix-len (1-96)
+
+   Length of the Source UPF Prefix (RFC 9433 Section 6.6, Figure 10) in
+   the outer IPv6 source address of Type 1 Session Transformed routes
+   installed into this VRF.  The prefix itself is the SRv6 locator of
+   this speaker, and the IPv4 Source Address carried by the route is
+   placed right after these bits, which is where the remote
+   End.M.GTP4.E reads it back from.
+
+   The same length is programmed into the End.M.GTP4.E and H.M.GTP4.D
+   endpoints this address family installs, so every node that writes or
+   reads that address has to be given the same value.  It defaults to
+   56, what Figure 10 leaves in front of the IPv4 address once the
+   Args.Mob.Session of the matching SID is accounted for.
+
+.. clicmd:: segment interwork
+
+   Enable Interwork Segment Discovery origination.
+
+.. clicmd:: segment direct
+
+   Enter the Direct Segment Discovery configuration block.
+
+   .. clicmd:: address A.B.C.D
+
+      Direct Segment Discovery originating-speaker address;
+      defaults to the BGP router-id.
+
+   .. clicmd:: behavior <dt4|dt6|dt46>
+
+      End.DT4, End.DT6 or End.DT46 endpoint behavior for the
+      Direct Segment Discovery SID, selected according to the
+      decapsulated payload's IP family.
+
+   .. clicmd:: segment-id ASN:NN
+
+      BGP MUP Extended Community Direct-Type Segment Identifier
+      carried on the Direct Segment Discovery route.
+
+Example configuration:
+
+.. code-block:: frr
+
+   segment-routing
+    srv6
+     locators
+      locator default
+       prefix 2001:db8:e::/48 block-len 24 node-len 24 func-bits 8
+   !
+   router bgp 65001
+    bgp router-id 1.1.1.1
+    neighbor 2001:db8::2 remote-as 65002
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     neighbor 2001:db8::2 activate
+    exit-address-family
+    !
+    address-family ipv6 mup
+     neighbor 2001:db8::2 activate
+    exit-address-family
+   exit
+   !
+   ! Interwork Segment Discovery origination on slice1.
+   router bgp 65001 vrf slice1
+    bgp router-id 1.1.1.1
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     redistribute connected
+     rd 100:100
+     rt export 65001:1
+     sid auto
+     segment interwork
+    exit-address-family
+    !
+    address-family ipv6 mup
+     redistribute connected
+     rd 200:200
+     rt export 65001:2
+     sid auto
+     segment interwork
+    exit-address-family
+   exit
+   !
+   ! Direct Segment Discovery origination on slice2.
+   router bgp 65001 vrf slice2
+    bgp router-id 1.1.1.1
+    !
+    segment-routing srv6
+     locator default
+    exit
+    !
+    address-family ipv4 mup
+     rd 300:300
+     rt export 65001:1
+     sid auto
+     segment direct
+      address 10.0.0.250
+      behavior dt4
+      segment-id 65001:10
+     exit
+    exit-address-family
+   exit
+
+FRR originates only Interwork Segment Discovery and Direct Segment
+Discovery routes; Type 1 and Type 2 Session Transformed route
+origination is not exposed.
+
+Route Import
+^^^^^^^^^^^^
+
+A non-default VRF ``router bgp`` instance imports received Mobile
+User Plane routes whose Route Target extended community matches one
+of its configured ``rt import`` (or ``rt both``) targets.  A VRF
+without an ``rt import`` line imports no routes.  Origination-side
+``rt export`` lines are not implicit imports; the export and import
+target lists are independent.
+
+A receive-only configuration looks like this:
+
+.. code-block:: frr
+
+   router bgp 65002 vrf slice1
+    address-family ipv4 mup
+     rt import 65001:1
+    exit-address-family
+   exit
+
+An imported Session Transformed route is resolved against the
+Discovery routes cached from the same SAFI and installed into the
+VRF forwarding table as an SRv6 route.  A Type 1 ST resolves
+through the Interwork Segment Discovery route covering its Tunnel
+Endpoint Address and installs an encapsulation route toward the
+synthesized End.M.GTP4.E or End.M.GTP6.E SID.  A Type 2 ST resolves
+through the Direct Segment Discovery route named by its Direct-Type
+Segment Identifier and installs an H.M.GTP4.D route toward that
+endpoint.  A route whose Discovery entry has not arrived stays in
+the RIB with no forwarding entry until one does.
+
+The headend behavior of the Type 1 ST route follows the
+``encap-behavior`` command described in
+:ref:`bgp-l3-service-over-srv6`, and defaults to H.Encaps.  That
+command always applies to the default BGP instance, so a single
+setting covers every VRF, and changing it replays the routes
+already installed.  H.Encaps.Red omits the segment that the outer
+IPv6 destination already carries, which for an IPv4 Tunnel Endpoint
+Address leaves no SRH at all.  The Type 2 ST route is unaffected:
+H.M.GTP4.D builds its own SRH and has no reduced form.
 
 .. _bgp-conditional-advertisement:
 
