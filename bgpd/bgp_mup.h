@@ -11,6 +11,8 @@
 
 #include "bgpd/bgpd.h"
 
+struct bgp_mup_fwd;
+
 /* prefix_mup carries the entire MUP route key in struct mup_prefix. */
 #define BGP_MUP_ROUTE_PREFIXLEN (sizeof(struct mup_prefix) * 8)
 
@@ -50,6 +52,10 @@ extern void bgp_mup_route2json(const struct prefix_mup *pm, struct json_object *
 
 /* Render the optional TLVs kept with a T1ST/T2ST route. */
 struct bgp_mup_nlri_data;
+/* Show the resolved forwarding state carried by a leaked MUP route. */
+extern void bgp_mup_fwd_show(const struct bgp_mup_fwd *fwd, struct vty *vty,
+			     struct json_object *json_path);
+
 extern void bgp_mup_nlri_data_show(const struct bgp_mup_nlri_data *tlvs, uint16_t route_type,
 				   struct vty *vty, struct json_object *json_path);
 
