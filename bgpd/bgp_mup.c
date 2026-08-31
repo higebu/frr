@@ -392,6 +392,81 @@ void bgp_mup_nlri_data_show(const struct bgp_mup_nlri_data *data, uint16_t route
 		json_object_object_add(json_path, "mupTlvs", json_tlvs);
 }
 
+/* Render the forwarding state a MUP route leaked into a vrf unicast RIB.
+ * The path's nexthop is only what best-path compared on; the SID and the
+ * seg6_mobile action shown here are where the traffic actually goes.
+ */
+void bgp_mup_fwd_show(const struct bgp_mup_fwd *fwd, struct vty *vty, struct json_object *json_path)
+{
+	bool have_action = fwd->seg6_mobile_action != ZEBRA_SEG6_MOBILE_ACTION_UNSPEC;
+	char buf[INET6_ADDRSTRLEN];
+	uint8_t i;
+
+	if (json_path) {
+		struct json_object *json_fwd = json_object_new_object();
+
+		json_object_object_add(json_path, "mupForwarding", json_fwd);
+		if (fwd->nh_type == NEXTHOP_TYPE_IPV6)
+			json_object_string_addf(json_fwd, "gate", "%pI6", &fwd->gate);
+		if (fwd->seg_num) {
+			struct json_object *json_segs = json_object_new_array();
+
+			for (i = 0; i < fwd->seg_num; i++) {
+				snprintfrr(buf, sizeof(buf), "%pI6", &fwd->segs[i]);
+				json_object_array_add(json_segs, json_object_new_string(buf));
+			}
+			json_object_object_add(json_fwd, "segs", json_segs);
+		}
+		if (!IPV6_ADDR_SAME(&fwd->encap_source, &in6addr_any))
+			json_object_string_addf(json_fwd, "encapSource", "%pI6",
+						&fwd->encap_source);
+		if (!have_action && fwd->seg_num &&
+		    fwd->encap_behavior != SRV6_HEADEND_BEHAVIOR_H_ENCAPS)
+			json_object_string_add(json_fwd, "encapBehavior",
+					       srv6_headend_behavior2str(fwd->encap_behavior,
+									 false));
+		if (have_action) {
+			json_object_string_add(json_fwd, "action",
+					       seg6_mobile_action2str(fwd->seg6_mobile_action));
+			seg6_mobile_context2json(&fwd->seg6_mobile_ctx, fwd->seg6_mobile_action,
+						 json_fwd);
+		}
+		return;
+	}
+
+	vty_out(vty, "      MUP forwarding:");
+	if (have_action)
+		vty_out(vty, " %s", seg6_mobile_action2str(fwd->seg6_mobile_action));
+	if (fwd->nh_type == NEXTHOP_TYPE_IPV6)
+		vty_out(vty, " gate %pI6", &fwd->gate);
+	if (fwd->seg_num) {
+		vty_out(vty, " segs [");
+		for (i = 0; i < fwd->seg_num; i++)
+			vty_out(vty, "%s%pI6", i ? " " : "", &fwd->segs[i]);
+		vty_out(vty, "]");
+	}
+	if (!IPV6_ADDR_SAME(&fwd->encap_source, &in6addr_any))
+		vty_out(vty, " encap source %pI6", &fwd->encap_source);
+	if (!have_action && fwd->seg_num &&
+	    fwd->encap_behavior != SRV6_HEADEND_BEHAVIOR_H_ENCAPS)
+		vty_out(vty, " encap behavior %s",
+			srv6_headend_behavior2str(fwd->encap_behavior, false));
+	if (have_action) {
+		char ctx_str[SEG6_MOBILE_CTX_STRLEN];
+		size_t len;
+
+		seg6_mobile_context2str(ctx_str, sizeof(ctx_str), &fwd->seg6_mobile_ctx,
+					fwd->seg6_mobile_action);
+		/* every field the helper emits carries a trailing space */
+		len = strlen(ctx_str);
+		while (len && ctx_str[len - 1] == ' ')
+			ctx_str[--len] = '\0';
+		if (len)
+			vty_out(vty, " %s", ctx_str);
+	}
+	vty_out(vty, "\n");
+}
+
 /* ISD leak entry points, defined alongside bgp_nlri_parse_mup below;
  * forward-declared so the SID-arrival and locator-delete hooks here
  * can drive emit/withdraw without reordering the file.
