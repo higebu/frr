@@ -14636,6 +14636,9 @@ skip_nexthop:
 		}
 	}
 
+	if (bgp_attr_get_mup_fwd(path->attr))
+		bgp_mup_fwd_show(bgp_attr_get_mup_fwd(path->attr), vty, json_path);
+
 	/* Label Index */
 	if (attr->label_index != BGP_INVALID_LABEL_INDEX) {
 		if (json_paths)
